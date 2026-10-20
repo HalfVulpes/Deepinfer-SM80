@@ -1,0 +1,120 @@
+{
+  "hardware": {
+    "gpu": "6x NVIDIA A100/GA100 64GB (SM80, 74 SMs per GPU)",
+    "topology": "TP2 x PP3 (VLLM_PP_LAYER_PARTITION=14,14,12)",
+    "speculative_decoding": "DSpark EAGLE K=5 (3 draft layers)",
+    "max_model_len": 1048576,
+    "max_num_seqs": 4,
+    "kv_cache_tokens_gpu": 4648480
+  },
+  "kernel_microbenchmarks_us": {
+    "combine_topk_swa_indices_T1536": {
+      "calls_per_chunk": 30,
+      "baseline_us": 1083.72,
+      "deepinfer_sm80_us": 48.88,
+      "speedup": 22.17,
+      "max_abs_diff": 0
+    },
+    "dequantize_and_gather_k_cache_48k": {
+      "calls_per_step": 38,
+      "baseline_us": 263.43,
+      "deepinfer_sm80_us": 34.47,
+      "speedup": 7.64,
+      "max_abs_diff": 0.0
+    },
+    "dequantize_and_gather_k_cache_16k": {
+      "calls_per_step": 38,
+      "baseline_us": 80.10,
+      "deepinfer_sm80_us": 19.93,
+      "speedup": 4.02,
+      "max_abs_diff": 0.0
+    },
+    "mhc_fused_post_pre_delayed_T12": {
+      "calls_per_step": 83,
+      "baseline_us": 357.70,
+      "deepinfer_sm80_us": 123.77,
+      "speedup": 2.89,
+      "max_abs_diff": 0.001953
+    },
+    "mhc_fused_post_pre_delayed_T6": {
+      "calls_per_step": 83,
+      "baseline_us": 163.64,
+      "deepinfer_sm80_us": 125.59,
+      "speedup": 1.30,
+      "max_abs_diff": 0.001953
+    },
+    "sparse_mla_decode_B6": {
+      "calls_per_step": 41,
+      "baseline_us": 149.64,
+      "deepinfer_sm80_us": 69.92,
+      "speedup": 2.14,
+      "max_abs_diff": 0.0
+    },
+    "sparse_mla_decode_B24": {
+      "calls_per_step": 41,
+      "baseline_us": 349.12,
+      "deepinfer_sm80_us": 167.51,
+      "speedup": 2.08,
+      "max_abs_diff": 0.0
+    },
+    "sparse_mla_prefill_T1536": {
+      "calls_per_chunk": 30,
+      "baseline_us": 3742.80,
+      "deepinfer_sm80_us": 3202.11,
+      "speedup": 1.17,
+      "max_abs_diff": 0.00488
+    },
+    "mhc_post_with_sqrsum_T1536": {
+      "calls_per_chunk": 83,
+      "baseline_us": 275.27,
+      "deepinfer_sm80_us": 232.62,
+      "speedup": 1.18,
+      "max_abs_diff": 0.0
+    }
+  },
+  "e2e_production_benchmarks": {
+    "prefill_16k_tps": {
+      "baseline": 3349.4,
+      "deepinfer_sm80": 4037.0,
+      "deepinfer_sm80_peak": 4059.0,
+      "improvement_pct": 20.53
+    },
+    "prefill_64k_tps": {
+      "baseline": 3627.3,
+      "deepinfer_sm80": 4506.8,
+      "deepinfer_sm80_peak": 4512.0,
+      "improvement_pct": 24.25
+    },
+    "ttft_64k_seconds": {
+      "baseline": 13.2,
+      "deepinfer_sm80": 10.7,
+      "improvement_pct": -18.94
+    },
+    "decode_4_stream_aggregate_prose_tps": {
+      "baseline": 163.8,
+      "deepinfer_sm80": 170.5,
+      "improvement_pct": 4.09
+    },
+    "decode_4_stream_per_seq_prose_tps": {
+      "baseline": 40.5,
+      "deepinfer_sm80": 41.8,
+      "deepinfer_sm80_peak": 45.3,
+      "improvement_pct": 3.21
+    },
+    "decode_1_stream_domains_tps": {
+      "chinese_prose_median": 62.3,
+      "chinese_prose_peak": 65.9,
+      "english_prose_median": 72.65,
+      "structured_json_median": 137.80,
+      "python_code_median": 160.81,
+      "long_gen_16k_plus": 188.82
+    },
+    "quality_verification": {
+      "plp_nll_baseline": [0.2787, 0.5533, 0.8827],
+      "plp_nll_deepinfer_sm80_run1": [0.2836, 0.5492, 0.9123],
+      "plp_nll_deepinfer_sm80_run2": [0.2734, 0.5510, 0.8689],
+      "api_protocol_tests_passed": "14/14",
+      "tool_parser_tests_passed": "16/16 (100% exact)"
+    }
+  }
+}

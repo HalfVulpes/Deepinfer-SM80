@@ -1,0 +1,1340 @@
+--- a/vllm/model_executor/kernels/mhc/tilelang.py
++++ b/vllm/model_executor/kernels/mhc/tilelang.py
+@@ -1013,6 +1013,271 @@
+     return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+ 
+ 
++def mhc_fused_post_pre_delayed_tilelang(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post_layer_mix: torch.Tensor,
++    comb_res_mix: torch.Tensor,
++    fn: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    rms_eps: float,
++    hc_pre_eps: float,
++    hc_sinkhorn_eps: float,
++    hc_post_mult_value: float,
++    sinkhorn_repeat: int,
++    pre_mix: torch.Tensor | None = None,
++    norm_weight: torch.Tensor | None = None,
++    norm_eps: float = 1e-6,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Run mHC post followed by mHC pre-delayed as a fused SM80 boundary pair."""
++    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
++        compute_num_split,
++        mhc_fused_tilelang,
++        mhc_post_sqrsum_tilelang,
++        mhc_pre_big_fuse_tilelang,
++    )
++    from vllm.model_executor.kernels.mhc.warmup import (
++        MHC_PRE_NORM_KERNEL,
++    )
++    from vllm.utils.deep_gemm import (
++        is_deep_gemm_supported,
++        tf32_hc_prenorm_gemm,
++    )
++    from vllm.utils.math_utils import cdiv
++
++    assert residual.ndim == 3 and residual.dtype == torch.bfloat16
++    assert residual.is_contiguous()
++    assert x.dtype == torch.bfloat16
++    assert post_layer_mix.dtype == torch.float32
++    assert comb_res_mix.dtype == torch.float32
++    assert fn.dtype == torch.float32
++    assert hc_scale.dtype == torch.float32
++    assert hc_base.dtype == torch.float32
++
++    num_tokens, hc_mult, hidden_size = residual.shape
++    hc_mult2 = hc_mult * hc_mult
++    hc_mult3 = hc_mult * (hc_mult + 2)
++    hc_hidden_size = hc_mult * hidden_size
++
++    residual_cur = torch.empty_like(residual)
++    post_mix_cur = torch.empty(
++        num_tokens, hc_mult, dtype=torch.float32, device=residual.device
++    )
++    comb_mix_cur = torch.empty(
++        num_tokens, hc_mult2, dtype=torch.float32, device=residual.device
++    )
++    layer_input_cur = torch.empty(
++        num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
++    )
++    next_pre_mix = torch.empty(
++        num_tokens, hc_mult, dtype=torch.float32, device=residual.device
++    )
++    outputs = (
++        residual_cur,
++        post_mix_cur.unsqueeze(-1),
++        comb_mix_cur.view(num_tokens, hc_mult, hc_mult),
++        layer_input_cur,
++        next_pre_mix,
++    )
++    if num_tokens == 0:
++        return outputs
++
++    x_flat = x.view(num_tokens, hidden_size)
++    post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
++    comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
++
++    use_deep_gemm = is_deep_gemm_supported()
++    use_small_fma = num_tokens <= 16
++    if use_small_fma:
++        tile_n, n_splits, fma_n_thr = _SMALL_FMA_CONFIG
++        if (
++            hc_mult3 % tile_n
++            or hidden_size % n_splits
++            or (hidden_size // n_splits) % fma_n_thr
++        ):
++            if (
++                hc_mult3 % 6 == 0
++                and hidden_size % 8 == 0
++                and (hidden_size // 8) % 128 == 0
++            ):
++                tile_n, n_splits, fma_n_thr = 6, 8, 128
++            else:
++                tile_n = 2 if num_tokens < 8 else 3
++                n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
++                fma_n_thr = 256
++                if (
++                    hc_mult3 % tile_n
++                    or hidden_size % n_splits
++                    or (hidden_size // n_splits) % fma_n_thr
++                ):
++                    use_small_fma = False
++                    n_splits = 1
++    else:
++        if use_deep_gemm:
++            n_splits = compute_num_split(
++                64, hc_hidden_size, cdiv(num_tokens, 64)
++            )
++        else:
++            n_splits = 1
++
++    gemm_out_mul = torch.empty(
++        n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
++    )
++    gemm_out_sqrsum = torch.empty(
++        n_splits, num_tokens, dtype=torch.float32, device=residual.device
++    )
++
++    if use_small_fma:
++        mhc_fused_tilelang(
++            comb_res_mix_flat,
++            residual,
++            post_layer_mix_flat,
++            x_flat,
++            fn.view(hc_mult3, hc_mult, hidden_size),
++            gemm_out_mul,
++            gemm_out_sqrsum,
++            residual_cur,
++            hc_mult,
++            hidden_size,
++            hc_mult3,
++            fma_n_thr,
++            256,
++            tile_n,
++            n_splits,
++        )
++    else:
++        residual_cur_2d = residual_cur.view(num_tokens, hc_hidden_size)
++        if use_deep_gemm:
++            from vllm.model_executor.kernels.mhc.tilelang_kernels import (
++                mhc_post_tilelang as _mhc_post_kernel,
++            )
++
++            _mhc_post_kernel(
++                comb_res_mix_flat,
++                residual,
++                post_layer_mix_flat,
++                x_flat,
++                residual_cur,
++                hc_mult,
++                hidden_size,
++            )
++            tf32_hc_prenorm_gemm(
++                residual_cur_2d,
++                fn,
++                gemm_out_mul,
++                gemm_out_sqrsum,
++                n_splits,
++            )
++        else:
++            mhc_post_sqrsum_tilelang(
++                comb_res_mix_flat,
++                residual,
++                post_layer_mix_flat,
++                x_flat,
++                residual_cur,
++                gemm_out_sqrsum,
++                hc_mult,
++                hidden_size,
++            )
++            _tilelang_hc_prenorm_gemm(
++                residual_cur_2d,
++                fn,
++                gemm_out_mul,
++                gemm_out_sqrsum,
++                hidden_size,
++                hc_mult,
++                sqrsum_ready=True,
++            )
++
++    if norm_weight is not None:
++        assert norm_weight.shape == (hidden_size,)
++        assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
++        MHC_PRE_NORM_KERNEL(
++            gemm_out_mul,
++            gemm_out_sqrsum,
++            hc_scale,
++            hc_base,
++            residual_cur,
++            post_mix_cur,
++            comb_mix_cur,
++            layer_input_cur,
++            norm_weight,
++            pre_mix if pre_mix is not None else post_mix_cur,
++            next_pre_mix,
++            hidden_size=hidden_size,
++            rms_eps=rms_eps,
++            hc_pre_eps=hc_pre_eps,
++            hc_sinkhorn_eps=hc_sinkhorn_eps,
++            hc_post_mult_value=hc_post_mult_value,
++            sinkhorn_repeat=sinkhorn_repeat,
++            norm_eps=norm_eps,
++            hc_mult=hc_mult,
++            use_pre_mix_in=pre_mix is not None,
++            save_pre_mix=True,
++            rms_numel=hc_hidden_size,
++        )
++        return outputs
++
++    mhc_pre_big_fuse_tilelang(
++        gemm_out_mul,
++        gemm_out_sqrsum,
++        hc_scale,
++        hc_base,
++        residual_cur,
++        post_mix_cur,
++        comb_mix_cur,
++        layer_input_cur,
++        pre_mix if pre_mix is not None else post_mix_cur,
++        next_pre_mix,
++        hidden_size,
++        rms_eps,
++        hc_pre_eps,
++        hc_sinkhorn_eps,
++        hc_post_mult_value,
++        sinkhorn_repeat,
++        n_splits,
++        hc_mult,
++        use_pre_mix_in=pre_mix is not None,
++        save_pre_mix=True,
++        rms_numel=hc_hidden_size,
++    )
++    return outputs
++
++
++def _mhc_fused_post_pre_delayed_tilelang_fake(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    post_layer_mix: torch.Tensor,
++    comb_res_mix: torch.Tensor,
++    fn: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    rms_eps: float,
++    hc_pre_eps: float,
++    hc_sinkhorn_eps: float,
++    hc_post_mult_value: float,
++    sinkhorn_repeat: int,
++    pre_mix: torch.Tensor | None = None,
++    norm_weight: torch.Tensor | None = None,
++    norm_eps: float = 1e-6,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    num_tokens, hc_mult, hidden_size = residual.shape
++    return (
++        torch.empty_like(residual),
++        torch.empty(
++            num_tokens, hc_mult, 1, dtype=torch.float32, device=residual.device
++        ),
++        torch.empty(
++            num_tokens, hc_mult, hc_mult, dtype=torch.float32, device=residual.device
++        ),
++        torch.empty(
++            num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
++        ),
++        torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=residual.device),
++    )
++
++
+ def _mhc_post_tilelang_fake(
+     x: torch.Tensor,
+     residual: torch.Tensor,
+@@ -1092,6 +1357,12 @@
+     mutates_args=[],
+     fake_impl=_mhc_fused_post_pre_tilelang_fake,
+ )
++direct_register_custom_op(
++    op_name="mhc_fused_post_pre_delayed_tilelang",
++    op_func=mhc_fused_post_pre_delayed_tilelang,
++    mutates_args=[],
++    fake_impl=_mhc_fused_post_pre_delayed_tilelang_fake,
++)
+ 
+ direct_register_custom_op(
+     op_name="hc_head_fused_kernel_tilelang",
+--- a/vllm/model_executor/kernels/mhc/warmup.py
++++ b/vllm/model_executor/kernels/mhc/warmup.py
+@@ -43,16 +43,21 @@
+ 
+     def get_warmup_keys(self, *, max_tokens: int, **fields) -> list[CompileKey]:
+         # The split heuristic changes only at 64-token boundaries.
+-        splits = (
+-            sorted(
+-                {
+-                    compute_mhc_pre_num_splits(fields["rms_numel"], num_tokens)
+-                    for num_tokens in range(1, max_tokens + 1, 64)
+-                }
+-            )
++        splits_set = (
++            {
++                compute_mhc_pre_num_splits(fields["rms_numel"], num_tokens)
++                for num_tokens in range(1, max_tokens + 1, 64)
++            }
+             if is_deep_gemm_supported()
+-            else [1]
++            else {1}
+         )
++        # Pre-warm the split_k={4,8,16} specializations used by _SMALL_FMA_CONFIG in
++        # mhc_fused_post_pre_delayed_tilelang for decode/verify (num_tokens <= 16).
++        if fields.get("rms_numel") == fields.get("hc_mult", 0) * fields.get(
++            "hidden_size", 0
++        ):
++            splits_set.update({4, 8, 16})
++        splits = sorted(splits_set)
+         return self._trace_dispatch(self.dispatch)(n_splits=splits, **fields)
+ 
+     def compile(self, compile_key: CompileKey) -> None:
+--- a/vllm/models/deepseek_v4_1/amd/rocm.py
++++ b/vllm/models/deepseek_v4_1/amd/rocm.py
+@@ -109,20 +109,27 @@
+     gather_lens_ptr,
+     M,
+     N,
++    num_tokens,
++    num_reqs,
+     TOP_K: tl.constexpr,
+     COMPRESS_RATIO: tl.constexpr,
+     WINDOW_SIZE: tl.constexpr,
+     TOPK_WIDTH: tl.constexpr,
+     PADDED_TOP_K: tl.constexpr,
++    COMBINED_TOPK: tl.constexpr,
+ ):
+     batch_idx = tl.program_id(0)
+     worker_id = tl.program_id(1)
+     num_workers = tl.num_programs(1)
+ 
+     base = tl.load(query_start_loc_ptr)
+-    query_start = tl.load(query_start_loc_ptr + batch_idx) - base
+-    query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
+-    query_len = query_end - query_start
++    query_start = tl.maximum(tl.load(query_start_loc_ptr + batch_idx) - base, 0)
++    query_end = tl.minimum(
++        tl.load(query_start_loc_ptr + batch_idx + 1) - base, num_tokens
++    )
++    query_len = tl.load(query_start_loc_ptr + batch_idx + 1) - tl.load(
++        query_start_loc_ptr + batch_idx
++    )
+     seq_len = tl.load(seq_lens_ptr + batch_idx)
+     gather_len = tl.load(gather_lens_ptr + batch_idx)
+     start_pos = seq_len - query_len
+@@ -131,36 +138,63 @@
+     for token_idx in range(query_start + worker_id, query_end, num_workers):
+         token_idx_in_query = token_idx - query_start
+         pos = start_pos + token_idx_in_query
+-        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
++
++        if COMPRESS_RATIO > 0:
++            topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
++            topk_len = tl.maximum(topk_len, 0)
++        else:
++            topk_len = 0
++
+         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+-
+-        topk_offset = tl.arange(0, PADDED_TOP_K)
+-        topk_mask = topk_offset < topk_len
+-        safe_topk_offset = tl.where(topk_offset < TOPK_WIDTH, topk_offset, 0)
+-        topk_indices = tl.load(
+-            topk_indices_ptr + token_idx * topk_indices_stride + safe_topk_offset,
+-            mask=topk_mask,
+-            other=-1,
+-        )
+-        valid_topk = (topk_indices >= 0) & (topk_indices < N)
+-        topk_indices = tl.where(valid_topk, topk_indices + M * batch_idx, -1)
++        swa_len = tl.maximum(swa_len, 0)
++        combined_len = topk_len + swa_len
++
++        row_ptr = combined_indices_ptr + token_idx * combined_indices_stride
++
++        # 1. Disjoint range [0, topk_len)
++        if TOP_K > 0:
++            topk_offset = tl.arange(0, PADDED_TOP_K)
++            topk_mask = (topk_offset < topk_len) & (topk_offset < TOPK_WIDTH)
++            topk_vals = tl.load(
++                topk_indices_ptr + token_idx * topk_indices_stride + topk_offset,
++                mask=topk_mask,
++                other=-1,
++            )
++            valid_topk = topk_mask & (topk_vals >= 0) & (topk_vals < N)
++            out_topk = tl.where(valid_topk, topk_vals + M * batch_idx, -1)
++            tl.store(
++                row_ptr + topk_offset,
++                out_topk,
++                mask=topk_mask,
++            )
++
++        # 2. Disjoint range [topk_len, topk_len + swa_len)
++        swa_offset = tl.arange(0, WINDOW_SIZE)
++        swa_mask = swa_offset < swa_len
++        swa_vals = M * batch_idx + N + swa_offset + pos - swa_len + 1 - gather_start
+         tl.store(
+-            combined_indices_ptr + token_idx * combined_indices_stride + topk_offset,
+-            topk_indices,
+-            mask=topk_mask,
+-        )
+-
+-        swa_offset = tl.arange(0, WINDOW_SIZE)
+-        tl.store(
+-            combined_indices_ptr
+-            + token_idx * combined_indices_stride
+-            + topk_len
+-            + swa_offset,
+-            M * batch_idx + N + swa_offset + pos - swa_len + 1 - gather_start,
+-            mask=swa_offset < swa_len,
+-        )
+-
+-        tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
++            row_ptr + topk_len + swa_offset,
++            swa_vals,
++            mask=swa_mask,
++        )
++
++        # 3. Disjoint range [combined_len, COMBINED_TOPK)
++        for c_start in tl.static_range(0, COMBINED_TOPK, 256):
++            c_offs = c_start + tl.arange(0, 256)
++            pad_mask = (c_offs >= combined_len) & (c_offs < COMBINED_TOPK)
++            tl.store(row_ptr + c_offs, -1, mask=pad_mask)
++
++        tl.store(combined_lens_ptr + token_idx, combined_len)
++
++    # Zero any trailing padding tokens beyond query_start_loc[num_reqs]
++    if batch_idx == 0:
++        total_q = tl.maximum(tl.load(query_start_loc_ptr + num_reqs) - base, 0)
++        for token_idx in range(total_q + worker_id, num_tokens, num_workers):
++            row_ptr = combined_indices_ptr + token_idx * combined_indices_stride
++            for c_start in tl.static_range(0, COMBINED_TOPK, 256):
++                c_offs = c_start + tl.arange(0, 256)
++                tl.store(row_ptr + c_offs, -1, mask=c_offs < COMBINED_TOPK)
++            tl.store(combined_lens_ptr + token_idx, 0)
+ 
+ 
+ def combine_topk_swa_indices(
+@@ -174,15 +208,7 @@
+     M: int,
+     N: int,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Combine compressed-attention and sliding-window indices with Torch.
+-
+-    The Triton implementation inherited from DeepSeek V4 launches a
+-    two-dimensional grid with 128 workers per request.  On gfx950 it can issue
+-    an out-of-bounds access for V4.1's mixed prefill metadata (including the
+-    synthetic mixed-token warmup).  This path is prefill-only and the tensors
+-    are small, so use ordinary Torch indexing until a gfx950-safe fused kernel
+-    is available.
+-    """
++    """Fused SM80 Triton kernel combining compressed-attention and SWA indices."""
+     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
+     num_tokens = topk_indices.shape[0]
+     combined_topk = (
+@@ -190,64 +216,50 @@
+         // _SPARSE_PREFILL_TOPK_ALIGNMENT
+         * _SPARSE_PREFILL_TOPK_ALIGNMENT
+     )
+-    combined_indices = torch.full(
++    num_reqs = seq_lens.shape[0]
++    if num_tokens == 0 or num_reqs == 0:
++        return (
++            torch.full(
++                (num_tokens, combined_topk),
++                fill_value=-1,
++                dtype=torch.int32,
++                device=topk_indices.device,
++            ),
++            torch.zeros(num_tokens, dtype=torch.int32, device=topk_indices.device),
++        )
++    combined_indices = torch.empty(
+         (num_tokens, combined_topk),
+-        fill_value=-1,
+         dtype=torch.int32,
+         device=topk_indices.device,
+     )
+     combined_lens = torch.empty(
+         num_tokens, dtype=torch.int32, device=topk_indices.device
+     )
+-
+-    # query_start_loc may have a non-zero base for a narrowed mixed batch.
+-    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+-    req_ids = torch.repeat_interleave(
+-        torch.arange(seq_lens.shape[0], device=seq_lens.device), query_lens
+-    )
+-    query_starts = query_start_loc[:-1] - query_start_loc[0]
+-    token_offsets = torch.arange(num_tokens, device=seq_lens.device) - (
+-        torch.repeat_interleave(query_starts, query_lens)
+-    )
+-    positions = seq_lens[req_ids] - query_lens[req_ids] + token_offsets
+-
+-    logical_topk_width = min(topk, topk_indices.shape[1])
+-    topk_lens = torch.minimum(
+-        (positions + 1) // compress_ratio,
+-        torch.full_like(positions, logical_topk_width),
+-    ).clamp_min(0)
+-    topk_offsets = torch.arange(logical_topk_width, device=seq_lens.device)
+-    topk_mask = topk_offsets[None, :] < topk_lens[:, None]
+-    topk_values = topk_indices[:, :logical_topk_width].to(torch.int32)
+-    topk_valid = topk_mask & (topk_values >= 0) & (topk_values < N)
+-    combined_indices[:, :logical_topk_width] = torch.where(
+-        topk_valid,
+-        topk_values + (M * req_ids).to(torch.int32)[:, None],
+-        -1,
+-    )
+-
+-    swa_lens = torch.minimum(
+-        positions + 1, torch.full_like(positions, window_size)
+-    ).clamp_min(0)
+-    swa_offsets = torch.arange(window_size, device=seq_lens.device)
+-    swa_mask = swa_offsets[None, :] < swa_lens[:, None]
+-    swa_columns = topk_lens[:, None] + swa_offsets[None, :]
+-    gather_starts = seq_lens - gather_lens
+-    swa_values = (
+-        M * req_ids[:, None]
+-        + N
+-        + swa_offsets[None, :]
+-        + positions[:, None]
+-        - swa_lens[:, None]
+-        + 1
+-        - gather_starts[req_ids, None]
+-    ).to(torch.int32)
+-    rows = torch.arange(num_tokens, device=seq_lens.device)[:, None].expand_as(
+-        swa_columns
+-    )
+-    flat_dst = rows[swa_mask] * combined_topk + swa_columns[swa_mask]
+-    combined_indices.view(-1).index_copy_(0, flat_dst, swa_values[swa_mask])
+-    combined_lens.copy_((topk_lens + swa_lens).to(torch.int32))
++    logical_topk_width = min(topk, topk_indices.shape[1]) if topk > 0 else 0
++    padded_top_k = max(16, triton.next_power_of_2(max(1, logical_topk_width)))
++    num_workers = min(256, max(32, triton.next_power_of_2(num_tokens // num_reqs)))
++
++    _combine_topk_swa_indices_kernel[(num_reqs, num_workers)](
++        combined_indices,
++        combined_indices.stride(0),
++        combined_lens,
++        topk_indices,
++        topk_indices.stride(0),
++        query_start_loc,
++        seq_lens,
++        gather_lens,
++        M,
++        N,
++        num_tokens,
++        num_reqs,
++        TOP_K=logical_topk_width,
++        COMPRESS_RATIO=compress_ratio,
++        WINDOW_SIZE=window_size,
++        TOPK_WIDTH=max(1, logical_topk_width),
++        PADDED_TOP_K=padded_top_k,
++        COMBINED_TOPK=combined_topk,
++        num_warps=4,
++    )
+     return combined_indices, combined_lens
+ 
+ 
+@@ -751,18 +763,39 @@
+             assert swa_metadata.is_valid_token is not None
+             assert self.topk_indices_buffer is not None
+             block_size = attn_metadata.block_size // self.compress_ratio
+-            is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
+-            (
+-                topk_ragged_indices,
+-                topk_ragged_indptr,
+-                topk_lens,
+-            ) = compute_global_topk_ragged_indices_and_indptr(
+-                self.topk_indices_buffer[:num_decode_tokens],
+-                swa_metadata.token_to_req_indices,
+-                attn_metadata.block_table[:num_decodes],
++            decode_cache_key = (
++                self.topk_indices_buffer.data_ptr(),
++                attn_metadata.block_table.data_ptr(),
+                 block_size,
+-                is_valid,
+-            )
++                num_decode_tokens,
++                num_decodes,
++            )
++            cached_decode = getattr(swa_metadata, "_cached_decode_topk", None)
++            if (
++                self.indexer is None
++                and cached_decode is not None
++                and cached_decode[0] == decode_cache_key
++            ):
++                _, topk_ragged_indices, topk_ragged_indptr, topk_lens = cached_decode
++            else:
++                is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
++                (
++                    topk_ragged_indices,
++                    topk_ragged_indptr,
++                    topk_lens,
++                ) = compute_global_topk_ragged_indices_and_indptr(
++                    self.topk_indices_buffer[:num_decode_tokens],
++                    swa_metadata.token_to_req_indices,
++                    attn_metadata.block_table[:num_decodes],
++                    block_size,
++                    is_valid,
++                )
++                swa_metadata._cached_decode_topk = (
++                    decode_cache_key,
++                    topk_ragged_indices,
++                    topk_ragged_indptr,
++                    topk_lens,
++                )
+ 
+         rocm_sparse_attn_decode(
+             q=q,
+@@ -878,28 +911,60 @@
+                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+             )
+ 
+-            combined_indices, combined_lens = combine_topk_swa_indices(
+-                topk_indices[query_start:query_end],
+-                query_start_loc[
+-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+-                ],
+-                seq_lens[chunk_start:chunk_end],
+-                gather_lens[chunk_start:chunk_end],
+-                self.window_size,
++            ragged_key = (
++                swa_only,
+                 self.compress_ratio,
+-                top_k,
++                chunk_start,
++                chunk_end,
++                query_start,
++                query_end,
+                 M,
+                 N,
+-            )
++                self.topk_indices_buffer.data_ptr(),
++            )
++            cached_ragged = getattr(swa_metadata, "_cached_prefill_ragged", None)
++            if (
++                self.indexer is None
++                and cached_ragged is not None
++                and cached_ragged[0] == ragged_key
++            ):
++                _, ragged_indices, ragged_indptr = cached_ragged
++            else:
++                combined_indices, combined_lens = combine_topk_swa_indices(
++                    topk_indices[query_start:query_end],
++                    query_start_loc[
++                        num_decodes + chunk_start : num_decodes + chunk_end + 1
++                    ],
++                    seq_lens[chunk_start:chunk_end],
++                    gather_lens[chunk_start:chunk_end],
++                    self.window_size,
++                    self.compress_ratio,
++                    top_k,
++                    M,
++                    N,
++                )
++                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
++                    combined_indices.reshape(combined_indices.shape[0], -1),
++                    combined_lens,
++                    num_rows=self.PREFILL_CHUNK_SIZE * M,
++                )
++                swa_metadata._cached_prefill_ragged = (
++                    ragged_key,
++                    ragged_indices,
++                    ragged_indptr,
++                )
++
+             rocm_sparse_attn_prefill(
+                 q=q[query_start:query_end],
+                 kv=kv.view(-1, 1, q.shape[-1]),
+-                indices=combined_indices,
+-                topk_length=combined_lens,
++                indices=None,
++                topk_length=None,
+                 scale=self.scale,
+                 head_dim=self.head_dim,
+                 nope_head_dim=self.nope_head_dim,
+                 rope_head_dim=self.rope_head_dim,
+                 attn_sink=self.attn_sink,
+                 output=output[query_start:query_end],
+-            )
++                ragged_indices=ragged_indices,
++                ragged_indptr=ragged_indptr,
++            )
+--- a/vllm/models/deepseek_v4_1/common/ops/cache_utils.py
++++ b/vllm/models/deepseek_v4_1/common/ops/cache_utils.py
+@@ -34,7 +34,12 @@
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.import_utils import is_cutedsl_supported
+-from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
++from vllm.v1.attention.ops.fp8_sm80 import (
++    _decode_fp8_f32,
++    _decode_fp8_lut,
++    _encode_fp8_u8,
++    get_e4m3fn_bf16_lut,
++)
+ from vllm.utils.math_utils import next_power_of_2
+ 
+ 
+@@ -228,6 +233,13 @@
+ 
+ 
+ @triton.jit
++def _decode_e8m0_scales_bf16_triton(encoded_scales):
++    """Bit-shift UE8M0 bytes to BF16: (e << 7) is the exact IEEE 754 BF16 representation of 2^(e - 127)."""
++    bits = (encoded_scales.to(tl.uint16) & 0xFF) << 7
++    return tl.where(encoded_scales == 0, 0, bits).to(tl.bfloat16, bitcast=True)
++
++
++@triton.jit
+ def _dequantize_and_gather_k_kernel(
+     out_ptr,
+     out_stride0,
+@@ -237,18 +249,10 @@
+     block_table_ptr,
+     offset,
+     gather_lens_ptr,
+-    # Constants
+-    max_blocks_per_seq: tl.constexpr,
+-    fp8_dim: tl.constexpr,  # 448
+-    bf16_dim: tl.constexpr,  # 64
+-    scale_dim: tl.constexpr,  # 8
+-    quant_block: tl.constexpr,  # 64 (quantization block size)
+-    cache_block_size: tl.constexpr,  # 64 or 128 (paged cache block size)
+-    token_data_size: tl.constexpr,  # 576 bytes per token data
+-    block_stride: tl.constexpr,  # total bytes per block (padded) int32
+-    output_dim: tl.constexpr,  # 512
+-    fp8_max: tl.constexpr,
+-    n_quant_blocks: tl.constexpr,  # 7 real blocks
++    fp8_lut_ptr,
++    max_blocks_per_seq,
++    cache_block_size: tl.constexpr,
++    block_stride,
+     use_fnuz: tl.constexpr = False,
+ ):
+     batch_idx = tl.program_id(0)
+@@ -263,77 +267,46 @@
+         gather_len = seq_len
+     start_pos = seq_len - gather_len
+ 
++    comb_offsets = tl.arange(0, 512)
++    nope_mask = comb_offsets < 448
++    scale_offsets = tl.arange(0, 8)
++    block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
++
+     for i in range(worker_id, gather_len, num_workers):
+-        # Calculate the actual token index in the sequence
+         pos = start_pos + i
+-
+-        # Calculate which block and position within block
+         block_in_seq = pos // cache_block_size
+         pos_in_block = pos % cache_block_size
+ 
+-        # Get physical block index from block table
+-        block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
+         physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)  # int32
+-
+-        # int64: physical_block_idx * block_stride can exceed 2^31 with many
+-        # KV-cache blocks (e.g. >= 57K at block_stride ~37K).
+         cache_block_ptr = k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
+ 
+-        # Token data pointer
+-        token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+-
+-        # Scale pointer: after all token data
+-        token_scale_ptr = (
+-            cache_block_ptr
+-            + cache_block_size * token_data_size
+-            + pos_in_block * scale_dim
+-        )
+-
+-        # Token data layout: [0:448] fp8, [448:576] bf16
+-        token_fp8_ptr = token_data_ptr
+-        token_bf16_ptr = token_data_ptr + fp8_dim
+-
+-        # Output pointer for this token (flattened)
++        token_data_ptr = cache_block_ptr + pos_in_block * 576
++        token_scale_ptr = cache_block_ptr + cache_block_size * 576 + pos_in_block * 8
++
++        # Load all 448 FP8 bytes in one vectorized pass + SM80 LUT decode
++        x_uint8 = tl.load(token_data_ptr + comb_offsets, mask=nope_mask, other=0)
++        k_vals = _decode_fp8_lut(x_uint8, use_fnuz, fp8_lut_ptr)
++
++        # Load 8 UE8M0 scale bytes and bit-shift to BF16
++        encoded_scales = tl.load(token_scale_ptr + scale_offsets)
++        scales = _decode_e8m0_scales_bf16_triton(encoded_scales)
++        scales_512 = tl.reshape(
++            tl.broadcast_to(scales[:, None], (8, 64)),
++            (512,),
++        )
++        k_nope = (k_vals.to(tl.float32) * scales_512.to(tl.float32)).to(tl.bfloat16)
++
++        # Load 64 BF16 RoPE elements directly in the upper 64 lanes
++        rope_ptr = (token_data_ptr + 448).to(tl.pointer_type(tl.bfloat16))
++        k_rope = tl.load(
++            rope_ptr + (comb_offsets - 448),
++            mask=~nope_mask,
++            other=0.0,
++        )
++
++        out_val = tl.where(nope_mask, k_nope, k_rope)
+         output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
+-
+-        # ========== Dequantize FP8 portion using UE8M0 ==========
+-        for qblock_idx in tl.static_range(n_quant_blocks):
+-            qblock_start = qblock_idx * quant_block
+-
+-            if qblock_start < fp8_dim:
+-                offsets = qblock_start + tl.arange(0, quant_block)
+-                mask = offsets < fp8_dim
+-
+-                # Load quantized fp8 values (stored as uint8)
+-                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+-
+-                # Decode fp8 bytes (FNUZ on gfx942, OCP elsewhere) to f32;
+-                # ALU decode below SM89 where Triton has no native convert.
+-                x_float = _decode_fp8_f32(x_uint8, use_fnuz)
+-
+-                # Load and decode UE8M0 scale
+-                # UE8M0: scale = 2^(stored_value - 127)
+-                encoded_scale = tl.load(token_scale_ptr + qblock_idx)
+-                exponent = encoded_scale.to(tl.float32) - 127.0
+-                scale = tl.exp2(exponent)
+-
+-                # Dequantize: bf16_value = fp8_value * scale
+-                x_dequant = x_float * scale
+-
+-                # Store as bf16
+-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+-
+-        # ========== Copy BF16 portion directly ==========
+-        bf16_output_offset = fp8_dim  # After 448 elements in output
+-
+-        # Read bf16 from cache
+-        bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
+-
+-        # Process in chunks of 16
+-        for j in tl.static_range(bf16_dim // 16):
+-            chunk_offsets = j * 16 + tl.arange(0, 16)
+-            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
+-            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
++        tl.store(output_row_ptr + comb_offsets, out_val)
+ 
+ 
+ def dequantize_and_gather_k_cache_triton(
+@@ -351,15 +324,11 @@
+     offset: int,
+     use_fnuz: bool = False,
+ ) -> None:
+-    TOKEN_FP8_DIM = 448
+-    TOKEN_BF16_DIM = 64
+-    TOKEN_SCALE_DIM = 8
+-    QUANT_BLOCK_SIZE = 64
+-    FP8_MAX = 448.0
+-    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+-
+     num_reqs = seq_lens.shape[0]
+-    NUM_WORKERS = 128
++    if num_reqs == 0:
++        return
++    fp8_lut = None if use_fnuz else get_e4m3fn_bf16_lut(k_cache.device)
++    NUM_WORKERS = 256
+     _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](
+         out,
+         out.stride(0),
+@@ -369,18 +338,12 @@
+         block_table,
+         offset,
+         gather_lens,
++        fp8_lut,
+         max_blocks_per_seq=block_table.shape[-1],
+-        fp8_dim=TOKEN_FP8_DIM,
+-        bf16_dim=TOKEN_BF16_DIM,
+-        scale_dim=TOKEN_SCALE_DIM,
+-        quant_block=QUANT_BLOCK_SIZE,
+         cache_block_size=block_size,
+-        token_data_size=TOKEN_DATA_SIZE,
+         block_stride=k_cache.stride(0),
+-        output_dim=512,
+-        fp8_max=FP8_MAX,
+-        n_quant_blocks=7,
+         use_fnuz=use_fnuz,
++        num_warps=4,
+     )
+ 
+ 
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -19,6 +19,7 @@
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.logger import init_logger
+ from vllm.model_executor.kernels.mhc.tilelang import (
++    mhc_fused_post_pre_delayed_tilelang,
+     mhc_post_tilelang,
+     mhc_pre_delayed_tilelang,
+ )
+@@ -371,8 +372,8 @@
+                     norm_eps=self.attn_norm.variance_epsilon,
+                 )
+         else:
+-            residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
+             if self.engram is not None and engram_hashes is not None:
++                residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
+                 # Engram injection happens between the previous sublayer's
+                 # post and this block's pre, on the full hc stream, so the
+                 # mix coefficients see the injected stream.
+@@ -381,42 +382,66 @@
+                     engram_hashes[:, self.engram.layer_hash_index],
+                     engram_mask,
+                 )
+-            post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
++                post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
++                    residual,
++                    self.hc_attn_fn,
++                    self.hc_attn_scale,
++                    self.hc_attn_base,
++                    self.rms_norm_eps,
++                    self.hc_eps,
++                    self.hc_eps,
++                    self.hc_post_alpha,
++                    self.hc_sinkhorn_iters,
++                    pre_mix=pre_mix,
++                    norm_weight=self.attn_norm.weight,
++                    norm_eps=self.attn_norm.variance_epsilon,
++                )
++            else:
++                residual, post_mix, res_mix, x, attn_pre = (
++                    mhc_fused_post_pre_delayed_tilelang(
++                        x,
++                        residual,
++                        post_mix,
++                        res_mix,
++                        self.hc_attn_fn,
++                        self.hc_attn_scale,
++                        self.hc_attn_base,
++                        self.rms_norm_eps,
++                        self.hc_eps,
++                        self.hc_eps,
++                        self.hc_post_alpha,
++                        self.hc_sinkhorn_iters,
++                        pre_mix=pre_mix,
++                        norm_weight=self.attn_norm.weight,
++                        norm_eps=self.attn_norm.variance_epsilon,
++                    )
++                )
++
++        if self.use_sequence_parallel:
++            x = sp_all_gather(x)[: positions.shape[0]]
++
++        x = self.attn(positions, x, None)
++        if self.use_sequence_parallel:
++            x = sp_reduce_scatter(x)
++
++        residual, post_mix, res_mix, x, ffn_pre = (
++            mhc_fused_post_pre_delayed_tilelang(
++                x,
+                 residual,
+-                self.hc_attn_fn,
+-                self.hc_attn_scale,
+-                self.hc_attn_base,
++                post_mix,
++                res_mix,
++                self.hc_ffn_fn,
++                self.hc_ffn_scale,
++                self.hc_ffn_base,
+                 self.rms_norm_eps,
+                 self.hc_eps,
+                 self.hc_eps,
+                 self.hc_post_alpha,
+                 self.hc_sinkhorn_iters,
+-                pre_mix=pre_mix,
+-                norm_weight=self.attn_norm.weight,
+-                norm_eps=self.attn_norm.variance_epsilon,
+-            )
+-
+-        if self.use_sequence_parallel:
+-            x = sp_all_gather(x)[: positions.shape[0]]
+-
+-        x = self.attn(positions, x, None)
+-        if self.use_sequence_parallel:
+-            x = sp_reduce_scatter(x)
+-
+-        residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
+-        post_mix, res_mix, x, ffn_pre = mhc_pre_delayed_tilelang(
+-            residual,
+-            self.hc_ffn_fn,
+-            self.hc_ffn_scale,
+-            self.hc_ffn_base,
+-            self.rms_norm_eps,
+-            self.hc_eps,
+-            self.hc_eps,
+-            self.hc_post_alpha,
+-            self.hc_sinkhorn_iters,
+-            pre_mix=attn_pre,
+-            norm_weight=self.ffn_norm.weight,
+-            norm_eps=self.ffn_norm.variance_epsilon,
++                pre_mix=attn_pre,
++                norm_weight=self.ffn_norm.weight,
++                norm_eps=self.ffn_norm.variance_epsilon,
++            )
+         )
+         x = self.ffn(x, input_ids)
+         return x, residual, post_mix, res_mix, ffn_pre
+@@ -772,6 +797,12 @@
+                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                 aux_hidden_states.append(aux_hidden_state)
+                 final_aux_recon = aux_recon
++                if (
++                    idx + 1 < self.end_layer
++                    and getattr(self.layers[idx + 1], "engram", None) is not None
++                ):
++                    hidden_states = aux_recon
++                    residual = post_mix = res_mix = None
+         if layer is not None:
+             # Reuse if the last layer was captured as an aux hidden state
+             if self.end_layer in self.aux_hidden_state_layers:
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -1571,14 +1571,14 @@
+     out_ptr,
+     q_stride_t,
+     q_stride_h,
+-    q_stride_d,
++    q_stride_d: tl.constexpr,
+     kv_stride_n,
+-    kv_stride_d,
++    kv_stride_d: tl.constexpr,
+     out_stride_t,
+     out_stride_h,
+-    out_stride_d,
+-    num_heads,
+-    head_dim,
++    out_stride_d: tl.constexpr,
++    num_heads: tl.constexpr,
++    head_dim: tl.constexpr,
+     num_kv,
+     scale,
+     HAS_ATTN_SINK: tl.constexpr,
+@@ -1989,6 +1989,13 @@
+         out_rope,
+         mask=head_mask[:, None],
+     )
++
++
++@triton.jit
++def _decode_e8m0_scales_bf16_triton(encoded_scales):
++    """Bit-shift UE8M0 bytes to BF16: (e << 7) is the exact IEEE 754 BF16 representation of 2^(e - 127)."""
++    bits = (encoded_scales.to(tl.uint16) & 0xFF) << 7
++    return tl.where(encoded_scales == 0, 0, bits).to(tl.bfloat16, bitcast=True)
+ 
+ 
+ @triton.jit
+@@ -2040,18 +2047,14 @@
+ 
+     head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+     head_mask = head_offsets < num_heads
+-    nope_offsets = tl.arange(0, NOPE_BLOCK)
+-    nope_mask = nope_offsets < NOPE_DIM
+-    rope_offsets = tl.arange(0, ROPE_DIM)
++
++    # Unified [0..512) dimension tile: [0:448] is NoPE (FP8), [448:512] is RoPE (BF16)
++    comb_offsets = tl.arange(0, NOPE_BLOCK)
++    nope_mask = comb_offsets < NOPE_DIM
+ 
+     q_row_ptr = q_ptr + query_idx * q_stride0 + head_offsets[:, None] * q_stride1
+-    q_nope = tl.load(
+-        q_row_ptr + nope_offsets[None, :],
+-        mask=head_mask[:, None] & nope_mask[None, :],
+-        other=0.0,
+-    )
+-    q_rope = tl.load(
+-        q_row_ptr + NOPE_DIM + rope_offsets[None, :],
++    q_comb = tl.load(
++        q_row_ptr + comb_offsets[None, :],
+         mask=head_mask[:, None],
+         other=0.0,
+     )
+@@ -2059,16 +2062,11 @@
+     neg_large = -3.4028234663852886e38
+     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+-    acc_nope = tl.zeros((BLOCK_H, NOPE_BLOCK), dtype=tl.float32)
+-    acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
++    acc_comb = tl.zeros((BLOCK_H, NOPE_BLOCK), dtype=tl.float32)
+     k_offsets = tl.arange(0, BLOCK_K)
+-
+-    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
+-    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+-
+-    # Each split processes a contiguous slice of this query's main (SWA) and
+-    # extra (topk) segments. Slices are handled independently so a block never
+-    # straddles the main/extra boundary.
++    scale_offsets = tl.arange(0, 8)
++    zero_comb = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
++
+     main_start = tl.load(main_indptr_ptr + query_idx)
+     main_end = tl.load(main_indptr_ptr + query_idx + 1)
+     main_len = main_end - main_start
+@@ -2090,32 +2088,36 @@
+         token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
+ 
+         x_uint8 = tl.load(
+-            token_data_ptr[:, None] + nope_offsets[None, :],
++            token_data_ptr[:, None] + comb_offsets[None, :],
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+         k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr)
++
+         encoded_scales = tl.load(
+-            token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+-            mask=valid[:, None] & nope_mask[None, :],
++            token_scale_ptr[:, None] + scale_offsets[None, :],
++            mask=valid[:, None],
+             other=127,
+         )
+-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+-        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+-        k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
++        scales = _decode_e8m0_scales_bf16_triton(encoded_scales)
++        scales_512 = tl.reshape(
++            tl.broadcast_to(scales[:, :, None], (BLOCK_K, 8, 64)),
++            (BLOCK_K, NOPE_BLOCK),
++        )
++        k_nope = k_vals * scales_512
+ 
+         rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+         k_rope = tl.load(
+-            rope_ptr[:, None] + rope_offsets[None, :],
+-            mask=valid[:, None],
++            rope_ptr[:, None] + (comb_offsets[None, :] - NOPE_DIM),
++            mask=valid[:, None] & ~nope_mask[None, :],
+             other=0.0,
+         )
+-        k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+-        k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+-
+-        scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
+-        scores *= scale
++
++        k_comb = tl.where(nope_mask[None, :], k_nope, k_rope)
++        k_comb = tl.where(valid[:, None], k_comb, zero_comb)
++        k_comb = tl.where(k_comb == k_comb, k_comb, zero_comb)
++
++        scores = tl.dot(q_comb, tl.trans(k_comb)) * scale
+         scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+ 
+         m_block = tl.max(scores, axis=1)
+@@ -2125,8 +2127,7 @@
+         p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+         l_new = l_i * alpha + tl.sum(p, axis=1)
+ 
+-        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+-        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
++        acc_comb = acc_comb * alpha[:, None] + tl.dot(p.to(k_comb.dtype), k_comb)
+         m_i = m_new
+         l_i = l_new
+ 
+@@ -2158,35 +2159,36 @@
+             )
+ 
+             x_uint8 = tl.load(
+-                token_data_ptr[:, None] + nope_offsets[None, :],
++                token_data_ptr[:, None] + comb_offsets[None, :],
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+             k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr)
++
+             encoded_scales = tl.load(
+-                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+-                mask=valid[:, None] & nope_mask[None, :],
++                token_scale_ptr[:, None] + scale_offsets[None, :],
++                mask=valid[:, None],
+                 other=127,
+             )
+-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+-            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+-            k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
++            scales = _decode_e8m0_scales_bf16_triton(encoded_scales)
++            scales_512 = tl.reshape(
++                tl.broadcast_to(scales[:, :, None], (BLOCK_K, 8, 64)),
++                (BLOCK_K, NOPE_BLOCK),
++            )
++            k_nope = k_vals * scales_512
+ 
+             rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+             k_rope = tl.load(
+-                rope_ptr[:, None] + rope_offsets[None, :],
+-                mask=valid[:, None],
++                rope_ptr[:, None] + (comb_offsets[None, :] - NOPE_DIM),
++                mask=valid[:, None] & ~nope_mask[None, :],
+                 other=0.0,
+             )
+-            k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+-            k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+-
+-            scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(
+-                q_rope,
+-                tl.trans(k_rope),
+-            )
+-            scores *= scale
++
++            k_comb = tl.where(nope_mask[None, :], k_nope, k_rope)
++            k_comb = tl.where(valid[:, None], k_comb, zero_comb)
++            k_comb = tl.where(k_comb == k_comb, k_comb, zero_comb)
++
++            scores = tl.dot(q_comb, tl.trans(k_comb)) * scale
+             scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+ 
+             m_block = tl.max(scores, axis=1)
+@@ -2196,8 +2198,7 @@
+             p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+             l_new = l_i * alpha + tl.sum(p, axis=1)
+ 
+-            acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+-            acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
++            acc_comb = acc_comb * alpha[:, None] + tl.dot(p.to(k_comb.dtype), k_comb)
+             m_i = m_new
+             l_i = l_new
+ 
+@@ -2213,13 +2214,8 @@
+         + head_offsets[:, None] * pa_stride_h
+     )
+     tl.store(
+-        acc_base + nope_offsets[None, :],
+-        acc_nope,
+-        mask=head_mask[:, None] & nope_mask[None, :],
+-    )
+-    tl.store(
+-        acc_base + NOPE_DIM + rope_offsets[None, :],
+-        acc_rope,
++        acc_base + comb_offsets[None, :],
++        acc_comb,
+         mask=head_mask[:, None],
+     )
+ 
+@@ -2754,6 +2750,7 @@
+     attn_sink: torch.Tensor | None,
+     nope_head_dim: int,
+     rope_head_dim: int,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
+     assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
+@@ -2784,7 +2781,8 @@
+     block_d = triton.next_power_of_2(head_dim)
+     block_k = _prefill_block_k(head_dim)
+     num_warps = 4
+-    out = torch.empty_like(q, dtype=torch.bfloat16)
++    if out is None:
++        out = torch.empty_like(q, dtype=torch.bfloat16)
+     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
+         q,
+         kv,
+@@ -2822,6 +2820,7 @@
+     nope_head_dim: int,
+     rope_head_dim: int,
+     topk_length: torch.Tensor | None = None,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+         indices,
+@@ -2839,6 +2838,7 @@
+         attn_sink=attn_sink,
+         nope_head_dim=nope_head_dim,
+         rope_head_dim=rope_head_dim,
++        out=out,
+     )
+ 
+ 
+@@ -3316,10 +3316,9 @@
+             BLOCK_K=block_k,
+             NUM_SPLITS=num_splits,
+             NUM_STAGES=1,
+-            # 8 warps rather than 4: the [BLOCK_H, 512] fp32 accumulators spill
+-            # ~1.7 KB/thread at 4 warps. At batch 1 only ~16 CTAs exist, so
+-            # warps-per-CTA is the only occupancy lever available.
+-            num_warps=8,
++            # On SM80 (74 SMs), use 4 warps when base_workgroups >= 12 (B >= 6 at TP2)
++            # to enable 2 CTAs/SM (8 warps/SM) without spilling; use 8 warps at B < 6.
++            num_warps=4 if base_workgroups >= 12 else 8,
+         )
+ 
+     _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](
+@@ -3430,6 +3429,11 @@
+         rope_head_dim,
+         "rocm_sparse_attn_prefill",
+     )
++    direct_out = (
++        output
++        if (output.dtype == torch.bfloat16 and output.stride(-1) == 1)
++        else None
++    )
+     if ragged_indices is not None and ragged_indptr is not None:
+         output_chunk = _rocm_sparse_attn_prefill_ragged_triton(
+             q=q,
+@@ -3440,6 +3444,7 @@
+             attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
+             nope_head_dim=nope_head_dim,
+             rope_head_dim=rope_head_dim,
++            out=direct_out,
+         )
+     else:
+         assert indices is not None
+@@ -3453,8 +3458,10 @@
+             nope_head_dim=nope_head_dim,
+             rope_head_dim=rope_head_dim,
+             topk_length=topk_length,
+-        )
+-    output.copy_(output_chunk.to(output.dtype))
++            out=direct_out,
++        )
++    if direct_out is None:
++        output.copy_(output_chunk.to(output.dtype))
+ 
+ 
+ def rocm_sparse_attn_decode(
+@@ -3507,7 +3514,13 @@
+         if topk_indices is not None:
+             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
+ 
+-    direct_out = output if _ON_GFX950 and output.dtype == torch.bfloat16 else None
++    direct_out = (
++        output
++        if (_ON_GFX950 or current_platform.is_cuda())
++        and output.dtype == torch.bfloat16
++        and output.stride(-1) == 1
++        else None
++    )
+     attn_out = _rocm_sparse_attn_decode_triton(
+         q=q,
+         main_cache=swa_k_cache,

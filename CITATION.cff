@@ -1,0 +1,49 @@
+cff-version: 1.2.0
+title: "DeepInfer-SM80: High-Performance DeepSeek-V4.1 Inference Kernels & 1M-Context Engine Optimizations for NVIDIA Ampere (SM80/SM86)"
+message: "If you use DeepInfer-SM80 in your research or production deployments, please cite this repository alongside the original DeepInfer and vLLM works."
+type: software
+authors:
+  - alias: "HalfVulpes"
+repository-code: "https://github.com/HalfVulpes/Deepinfer-SM80"
+license: Apache-2.0
+keywords:
+  - deepseek
+  - deepinfer
+  - vllm
+  - cuda
+  - triton
+  - tilelang
+  - ampere
+  - sm80
+  - a100
+  - rtx-3090
+  - sparse-mla
+  - mhc
+references:
+  - type: software
+    title: "DeepInfer: High-Performance Inference Kernels for DeepSeek Models"
+    authors:
+      - name: "DeepSeek Team"
+  - type: conference-paper
+    title: "Efficient Memory Management for Large Language Model Serving with PagedAttention"
+    authors:
+      - family-names: "Kwon"
+        given-names: "Woosuk"
+      - family-names: "Li"
+        given-names: "Zhuohan"
+      - family-names: "Zhuang"
+        given-names: "Siyuan"
+      - family-names: "Sheng"
+        given-names: "Ying"
+      - family-names: "Zheng"
+        given-names: "Lianmin"
+      - family-names: "Yu"
+        given-names: "Cody Hao"
+      - family-names: "Gonzalez"
+        given-names: "Joseph E."
+      - family-names: "Zhang"
+        given-names: "Hao"
+      - family-names: "Stoica"
+        given-names: "Ion"
+    collection-title: "Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles (SOSP 2023)"
+    year: 2023
