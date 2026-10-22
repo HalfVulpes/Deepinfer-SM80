@@ -150,7 +150,8 @@ Deepinfer-SM80/
 ├── LICENSE                            # Apache-2.0 License
 ├── CITATION.cff                       # Citation metadata (DeepInfer-SM80, DeepInfer, vLLM)
 ├── patches/
-│   └── vllm-sm80-deepinfer.patch      # Unified git patch for vLLM V1 (all 6 files, 1,340 lines)
+│   ├── 00-vllm-pr56201-sm80-base.patch # Base SM80 enablement patch on top of vllm PR #56201 (79a7108d9a)
+│   └── vllm-sm80-deepinfer.patch      # DeepInfer-SM80 kernel & YOCO optimization patch (all 6 files, 1,529 lines)
 ├── vllm_sm80_deepinfer/               # Drop-in optimized vLLM Python/Triton/TileLang modules
 │   └── vllm/
 │       ├── model_executor/kernels/mhc/
@@ -185,16 +186,35 @@ Deepinfer-SM80/
 
 ---
 
-## Quick Start & Installation
+## Base vLLM Version, Fork Lineage & Quick Start
 
-### Option A: Apply the Unified Git Patch to vLLM
-From the root of your vLLM checkout:
+### Why `vllm-sm80-deepinfer.patch` Does Not Apply Directly to Latest Upstream `vllm/main`
+1. **Upstream Package Rename (`PR #56741`)**: Upstream [`vllm-project/vllm` PR `#56741`](https://github.com/vllm-project/vllm/pull/56741) (commit [`cf1584f373`](https://github.com/vllm-project/vllm/commit/cf1584f373)) renamed `vllm/models/deepseek_v4_1/` to `vllm/models/deepseek_v41/`.
+2. **SM80 Base Enablement**: Upstream `vllm/main` currently ships only the Blackwell (`SM100` FlashInfer/CuteDSL) and AMD ROCm (`gfx942`/`gfx950`) backends for `DeepSeek-V4.1-Flash`. Running `DeepSeek-V4.1-Flash` on NVIDIA Ampere (`SM80`/`SM86`) requires the SM80 base enablement layer derived from:
+   - **Upstream vLLM Base**: [`vllm-project/vllm` PR `#56201` (`[Model] Support DeepSeek-V4.1-Flash`)](https://github.com/vllm-project/vllm/pull/56201) at commit [`79a7108d9aea27ddab99ce1779290d300b17fc23`](https://github.com/vllm-project/vllm/commit/79a7108d9aea27ddab99ce1779290d300b17fc23) (`v0.28.1rc0` base).
+   - **Community SM80 Fork**: [`haosdent/vllm` (`dsv4-flash-a100` / `deepseek-v4-a100-support`, commits `62195e9..c3046d1`)](https://github.com/haosdent/vllm/tree/dsv4-flash-a100) rebased onto `79a7108d9aea27ddab99ce1779290d300b17fc23` + V4.1 SM80 Sparse MLA / software-FP8 / DSpark-on-PP enablement (provided in full in [`patches/00-vllm-pr56201-sm80-base.patch`](patches/00-vllm-pr56201-sm80-base.patch)).
+
+### Option A: Reproducible Full Build from Upstream `vllm-project/vllm` (`79a7108d9a`)
+Clone `vllm`, check out the exact PR `#56201` commit (`79a7108d9aea27ddab99ce1779290d300b17fc23`), and apply the two patches in order:
 ```bash
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+git fetch origin 79a7108d9aea27ddab99ce1779290d300b17fc23
+git checkout 79a7108d9aea27ddab99ce1779290d300b17fc23
+
+# Step 1: Apply the SM80 base enablement layer (haosdent/vllm dsv4-flash-a100 rebased onto PR #56201)
+git apply /path/to/Deepinfer-SM80/patches/00-vllm-pr56201-sm80-base.patch
+
+# Step 2: Apply the DeepInfer-SM80 kernel & YOCO optimizations
 git apply /path/to/Deepinfer-SM80/patches/vllm-sm80-deepinfer.patch
 ```
 
-### Option B: Bind-Mount or Copy Drop-In Modules
-Copy the 6 drop-in files directly into your `vllm` Python package directory (or bind-mount them as read-only overlays in Docker):
+### Option B: Apply Only `vllm-sm80-deepinfer.patch` or Drop-In Modules to an Existing SM80 Tree
+If you are already running the SM80 base branch (`11cf4a67f9` on top of `79a7108d9a`):
+```bash
+git apply /path/to/Deepinfer-SM80/patches/vllm-sm80-deepinfer.patch
+```
+Or copy/bind-mount the 6 drop-in files directly into your `vllm` Python package directory:
 ```bash
 cp -r vllm_sm80_deepinfer/vllm/* /path/to/site-packages/vllm/
 ```
@@ -228,7 +248,7 @@ When deploying DeepSeek-V4.1 (`40` Backbone + `3` DSpark EAGLE layers) across 6�
 This work builds directly upon the architectural innovations and open-source foundations of the following projects:
 
 1. **[DeepSeek Team — `DeepInfer`](https://github.com/deepseek-ai/DeepInfer)**: Original `DeepSeek-V4.1` inference engine, `DeepSelect` Sparse MLA architecture, `YOCO` shared-KV design, `DSpark` multi-token speculative decoding, and `mHC` (Manifold-Constrained Hyper-Connections) algorithms.
-2. **[vLLM Project](https://github.com/vllm-project/vllm)**: PagedAttention, vLLM V1 engine scheduler, and distributed `TP × PP` execution runtime.
+2. **[vLLM Project](https://github.com/vllm-project/vllm)** & **[`haosdent/vllm` (`dsv4-flash-a100`)](https://github.com/haosdent/vllm/tree/dsv4-flash-a100)**: PagedAttention, vLLM V1 engine scheduler, DeepSeek-V4.1 PR [`#56201`](https://github.com/vllm-project/vllm/pull/56201) (`79a7108d9a`), and initial SM80 A100 enablement.
 3. **[TileLang](https://github.com/tile-ai/tilelang)** & **[OpenAI Triton](https://github.com/triton-lang/triton)**: DSL compilers enabling high-performance SM80 Tensor Core and warp-level kernel synthesis in Python.
 4. **[FlashInfer](https://github.com/flashinfer-ai/flashinfer)** & **[IST-DASLab Marlin](https://github.com/IST-DASLab/marlin)**: Sparse MLA and `MXFP4`/`W4A16` Ampere Tensor Core GEMM primitives.
 
