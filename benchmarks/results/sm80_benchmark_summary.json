@@ -1,11 +1,13 @@
 {
   "hardware": {
-    "gpu": "6x NVIDIA A100/GA100 64GB (SM80, 74 SMs per GPU)",
-    "topology": "TP2 x PP3 (VLLM_PP_LAYER_PARTITION=14,14,12)",
+    "gpu_6card": "6x NVIDIA A100/GA100 64GB (SM80, 74 SMs per GPU), TP2 x PP3 (14,14,12)",
+    "gpu_8card": "8x NVIDIA A100/GA100 64GB (SM80, 74 SMs per GPU), TP4 x PP2 (20,20)",
     "speculative_decoding": "DSpark EAGLE K=5 (3 draft layers)",
     "max_model_len": 1048576,
-    "max_num_seqs": 4,
-    "kv_cache_tokens_gpu": 4648480
+    "max_num_seqs_6card": 4,
+    "max_num_seqs_8card": 12,
+    "kv_cache_tokens_gpu_6card": 4650231,
+    "kv_cache_tokens_gpu_8card": 13306380
   },
   "kernel_microbenchmarks_us": {
     "combine_topk_swa_indices_T1536": {
@@ -115,6 +117,41 @@
       "plp_nll_deepinfer_sm80_run2": [0.2734, 0.5510, 0.8689],
       "api_protocol_tests_passed": "14/14",
       "tool_parser_tests_passed": "16/16 (100% exact)"
+    }
+  },
+  "e2e_8gpu_tp4pp2_benchmarks": {
+    "topology": "8x GA100 64GB (SM80), TP4 x PP2 (VLLM_PP_LAYER_PARTITION=20,20)",
+    "gpu_kv_cache_tokens": 13306380,
+    "gpu_1m_context_concurrency": 12.69,
+    "max_num_seqs": 12,
+    "cross_pp_kv_replication_bytes": 0,
+    "decode_domains_tps": {
+      "code_1_stream_median": 179.74,
+      "code_4_stream_aggregate": 401.49,
+      "structured_json_1_stream_median": 151.36,
+      "chinese_prose_1_stream_median": 72.02,
+      "chinese_prose_4_stream_aggregate": 182.11
+    },
+    "decode_scaling_1_2_4_12": {
+      "concurrencies": [1, 2, 4, 12],
+      "code_sum_stream_tps": [153.35, 265.96, 421.64, 620.22],
+      "code_wall_aggregate_tps": [153.35, 257.37, 315.30, 521.79],
+      "code_per_stream_tps": [153.35, 132.98, 105.41, 51.68],
+      "prose_sum_stream_tps": [92.89, 142.31, 197.56, 345.99],
+      "prose_wall_aggregate_tps": [92.89, 139.27, 195.79, 311.52],
+      "prose_per_stream_tps": [92.89, 71.16, 49.39, 28.83]
+    },
+    "prefill_scaling_1_2_4_12_18k_per_req": {
+      "concurrencies": [1, 2, 4, 12],
+      "total_prompt_tokens": [18347, 36778, 73731, 220704],
+      "aggregate_prefill_tps": [3463.5, 3469.9, 3463.4, 3479.2],
+      "mean_ttft_seconds": [5.30, 7.95, 13.59, 34.48],
+      "max_ttft_seconds": [5.30, 10.60, 21.29, 63.43]
+    },
+    "prefill_long_context_scaling": {
+      "context_tokens": [18347, 40607, 162197, 649022],
+      "prefill_tps": [3463.5, 3541.5, 3436.1, 2759.9],
+      "ttft_seconds": [5.30, 11.47, 47.20, 235.16]
     }
   }
 }

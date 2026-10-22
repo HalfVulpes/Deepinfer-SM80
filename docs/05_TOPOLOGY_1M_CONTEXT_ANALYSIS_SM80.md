@@ -98,3 +98,26 @@ Because vLLM sizes the KV block pool to the **minimum** across all PP stages, **
 Combining Steps 1–4 increases the bottleneck stage's available KV pool from **`6.67 GiB/GPU` to `~9.15 GiB/GPU`**, increasing GPU-resident KV capacity on the same 6× GA100 64GB cards from:
 $$\mathbf{4,756,478\text{ tokens } (4.53 \times 1\text{M})} \;\longrightarrow\; \mathbf{\sim 6,520,000\text{ tokens } (6.22 \times 1\text{M full context streams!})}$$
 while simultaneously delivering **`~2.0×` faster 1M cold prefill (`~255s`)** and **`165–180 tok/s` (code) / `90–112 tok/s` (prose)** single-user decode throughput!
+
+---
+
+## 4. Scaling to 8× GA100 64GB (`SM80`): Why `TP4 × PP2` (`20, 20`) Unlocks `12.69 × 1M` Full Context Streams
+
+When all **8× GA100 64GB (`SM80`)** GPUs are dedicated to `DeepSeek-V4.1-Flash` (`40` Backbone + `3` DSpark EAGLE layers), **`TP4 × PP2` (`VLLM_PP_LAYER_PARTITION=20,20`, `--gpu-memory-utilization 0.95`, `max_num_seqs=12`)** achieves a **`2.86×` increase in GPU-resident KV capacity** (`13,306,380` tokens = **`12.69 × 1M`** full context streams):
+
+### 4.1 Zero Cross-Stage KV Replication of `L20` (`20, 20` YOCO Partition Alignment)
+- **`PP0` (`GPUs 0–3`, `TP=4`, `L0–L19`)**: Holds all 20 Encoder layers (`kv_source_layer_ids = [2, 8, 14]`, each `compress_ratio = 2` $\implies 3 \times 358 = 1,074\text{ B/tok}$). Model weights take **`32.89 GiB/GPU`**, leaving **`22.29 GiB/GPU`** for KV cache.
+- **`PP1` (`GPUs 4–7`, `TP=4`, `L20–L39 + DSpark L40–L42`)**: Holds all 20 YOCO Consumer layers (`kv_source_layer_ids = [20]`, `compress_ratio = 1` $\implies 716\text{ B/tok}$). Because `L20–L39` all reside on `PP1`, **Layer 20's uncompressed KV cache never crosses a pipeline boundary and has zero cross-PP shadow copies!** Model weights take **`36.32 GiB/GPU`**, leaving **`18.70 GiB/GPU`** for KV cache (**`13,306,380` tokens** across `207,912` blocks).
+
+### 4.2 Production 8-GPU `TP4 × PP2` (`12.69 × 1M`) Concurrency Benchmark (`C = 1, 2, 4, 12`)
+
+| Concurrency (`C`) | **Decode: Code (`K=5`, `512` tok/seq)** | **Decode: Prose (`K=5`, `512` tok/seq)** | **Cold Prefill (`18.4K` tok/req)** | **Prefill Mean / Max TTFT** |
+| :---: | :---: | :---: | :---: | :---: |
+| **`C = 1`** (`1` Stream) | **`153.35 tok/s`** (`153.35/seq`, peak `179.74`) | **`92.89 tok/s`** (`92.89/seq`) | **`3,463.5 tok/s`** (`18.3K` total) | `5.30 s` / `5.30 s` |
+| **`C = 2`** (`2` Streams) | **`265.96 tok/s`** (`132.98/seq`, wall `257.4`) | **`142.31 tok/s`** (`71.16/seq`, wall `139.3`) | **`3,469.9 tok/s`** (`36.8K` total) | `7.95 s` / `10.60 s` |
+| **`C = 4`** (`4` Streams) | **`421.64 tok/s`** (`105.41/seq`, wall `315.3`) | **`197.56 tok/s`** (`49.39/seq`, wall `195.8`) | **`3,463.4 tok/s`** (`73.7K` total) | `13.59 s` / `21.29 s` |
+| **`C = 12`** (`12` Streams) | **`620.22 tok/s`** (`51.68/seq`, wall `521.8`) | **`345.99 tok/s`** (`28.83/seq`, wall `311.5`) | **`3,479.2 tok/s`** (`220.7K` total) | `34.48 s` / `63.43 s` |
+
+### 4.3 Why `--gpu-memory-utilization 0.95` Is the Exact Safe Ceiling on `TP4 × PP2`
+- At `0.95` (`60.80 GiB/GPU` target), `PP1` allocates `36.32 GiB` weights + `18.70 GiB` KV cache + `~2.46 GiB` CUDA graphs/activations = `57.48 GiB` baseline, leaving **`~5.8 GiB/GPU`** of dynamic workspace headroom below the `64.00 GiB` physical ceiling.
+- During a **`649,000`-token single-stream cold prefill** (`2,759.9 tok/s`, `235.16 s` TTFT), transient Lightning Indexer (`L20` `compress_ratio=0` over `649K` states) and Sparse MLA workspace buffers push `PP1` (`GPUs 4–7`) to **`63.272 GiB / 64.000 GiB`** (`23.2 MiB` physical free memory, requiring PyTorch `CUDACachingAllocator` cache flushes). Raising `--gpu-memory-utilization` to `0.97` or `0.98` would consume an extra `1.28–1.92 GiB/GPU` for static KV blocks and trigger immediate `CUDA out of memory` on `PP1` whenever context length exceeds `~450K` tokens.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generate high-resolution (300 DPI) benchmark charts for SM80 DeepInfer Optimization.
-Reads production benchmark JSONs from benchmarks/logs/ and kernel microbenchmark measurements.
+Reads production benchmark JSONs from benchmarks/results/ and kernel microbenchmark measurements.
 """
 import json
 from pathlib import Path
@@ -32,6 +32,8 @@ plt.rcParams.update({
 COLOR_BASE = "#4C72B0"
 COLOR_OPT = "#DD8452"
 COLOR_ACCENT = "#55A868"
+COLOR_RED = "#C44E52"
+COLOR_PURPLE = "#8172B3"
 
 
 def plot_kernel_speedups():
@@ -231,8 +233,106 @@ def plot_e2e_production():
     print("Saved:", out_path)
 
 
+def plot_8gpu_tp4pp2_scaling():
+    summary_file = ROOT / "benchmarks" / "results" / "sm80_benchmark_summary.json"
+    if not summary_file.exists():
+        return
+    data = json.loads(summary_file.read_text()).get("e2e_8gpu_tp4pp2_benchmarks")
+    if not data:
+        return
+
+    dec = data["decode_scaling_1_2_4_12"]
+    pref = data["prefill_scaling_1_2_4_12_18k_per_req"]
+    concs = dec["concurrencies"]  # [1, 2, 4, 12]
+    x_pos = np.arange(len(concs))
+    x_labels = [f"{c} Stream{'s' if c > 1 else ''}\n(C={c})" for c in concs]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15.0, 6.0))
+
+    # --- Left Subplot: Decode Scaling Line Chart (1, 2, 4, 12 Streams) ---
+    code_agg = dec["code_sum_stream_tps"]
+    code_per = dec["code_per_stream_tps"]
+    prose_agg = dec["prose_sum_stream_tps"]
+    prose_per = dec["prose_per_stream_tps"]
+
+    ax1.plot(x_pos, code_agg, marker="o", linewidth=2.6, markersize=8, color=COLOR_OPT,
+             label="Code Aggregate Throughput (tok/s)")
+    ax1.plot(x_pos, prose_agg, marker="s", linewidth=2.6, markersize=8, color=COLOR_BASE,
+             label="Prose Aggregate Throughput (tok/s)")
+    ax1.plot(x_pos, code_per, marker="^", linewidth=2.0, markersize=7, linestyle="--", color=COLOR_RED,
+             label="Code Per-Stream Throughput (tok/s/seq)")
+    ax1.plot(x_pos, prose_per, marker="d", linewidth=2.0, markersize=7, linestyle="--", color=COLOR_ACCENT,
+             label="Prose Per-Stream Throughput (tok/s/seq)")
+
+    for i, (ca, pa, cp, pp) in enumerate(zip(code_agg, prose_agg, code_per, prose_per)):
+        ax1.annotate(f"{ca:.1f}", (x_pos[i], ca), textcoords="offset points", xytext=(0, 8),
+                     ha="center", fontsize=9.5, fontweight="bold", color="#B03A2E")
+        ax1.annotate(f"{pa:.1f}", (x_pos[i], pa), textcoords="offset points", xytext=(0, 8),
+                     ha="center", fontsize=9.5, fontweight="bold", color="#1F618D")
+        if i > 0:
+            cp_offset = (0, 8) if i == 3 else (0, -15)
+            ax1.annotate(f"{cp:.1f}/seq", (x_pos[i], cp), textcoords="offset points", xytext=cp_offset,
+                         ha="center", fontsize=8.5, color="#922B21")
+            ax1.annotate(f"{pp:.1f}/seq", (x_pos[i], pp), textcoords="offset points", xytext=(0, -15),
+                         ha="center", fontsize=8.5, color="#1E8449")
+
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(x_labels)
+    ax1.set_ylabel("Decode Throughput (tokens/sec, DSpark K=5)")
+    ax1.set_title("8× GA100 (TP4×PP2, 12.69×1M KV)\nDecode Scaling (C = 1, 2, 4, 12)")
+    ax1.set_ylim(0, 700)
+    ax1.legend(loc="upper left", fontsize=9.2)
+
+    # --- Right Subplot: Prefill Concurrency Scaling (1, 2, 4, 12 Streams @ 18.4K/req) ---
+    pref_tps = pref["aggregate_prefill_tps"]
+    mean_ttft = pref["mean_ttft_seconds"]
+    max_ttft = pref["max_ttft_seconds"]
+
+    ax2_twin = ax2.twinx()
+    ax2_twin.grid(False)
+
+    l1 = ax2.plot(x_pos, pref_tps, marker="o", linewidth=2.8, markersize=8.5, color=COLOR_ACCENT,
+                  label="Aggregate Cold Prefill Throughput (tok/s)")
+    l2 = ax2_twin.plot(x_pos, mean_ttft, marker="s", linewidth=2.3, markersize=7.5, linestyle="-.", color=COLOR_PURPLE,
+                       label="Mean TTFT across C Streams (seconds)")
+    l3 = ax2_twin.plot(x_pos, max_ttft, marker="^", linewidth=2.0, markersize=7.0, linestyle=":", color=COLOR_RED,
+                       label="Max (Last-Stream) TTFT (seconds)")
+
+    for i, (pt, mt, xt) in enumerate(zip(pref_tps, mean_ttft, max_ttft)):
+        ax2.annotate(f"{pt:,.1f} tok/s\n({pref['total_prompt_tokens'][i]//1000}K tot)",
+                     (x_pos[i], pt), textcoords="offset points", xytext=(0, 10),
+                     ha="center", fontsize=9.0, fontweight="bold", color="#1E8449")
+        mt_offset = (0, -15) if i == 3 else (10, -10)
+        mt_ha = "center" if i == 3 else "left"
+        ax2_twin.annotate(f"{mt:.1f}s", (x_pos[i], mt), textcoords="offset points", xytext=mt_offset,
+                          ha=mt_ha, fontsize=8.8, fontweight="bold", color="#5B2C6F")
+        if i > 0:
+            ax2_twin.annotate(f"{xt:.1f}s", (x_pos[i], xt), textcoords="offset points", xytext=(-10, 6),
+                              ha="right", fontsize=8.8, fontweight="bold", color="#922B21")
+
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(x_labels)
+    ax2.set_ylabel("Aggregate Cold Prefill Throughput (tokens/sec)", color="#1E8449")
+    ax2_twin.set_ylabel("Time-To-First-Token / Span Latency (seconds)", color="#5B2C6F")
+    ax2.set_title("8× GA100 (TP4×PP2, 18.4K/Req)\nCold Prefill Scaling (C = 1, 2, 4, 12)")
+    ax2.set_ylim(0, 4400)
+    ax2_twin.set_ylim(0, 105)
+
+    lines = l1 + l2 + l3
+    labels = [l.get_label() for l in lines]
+    ax2.legend(lines, labels, loc="center left", fontsize=9.0)
+
+    plt.subplots_adjust(wspace=0.24)
+    plt.tight_layout()
+    out_path = CHARTS_DIR / "05_8gpu_tp4pp2_scaling_1_2_4_12.png"
+    plt.savefig(out_path)
+    plt.close(fig)
+    print("Saved:", out_path)
+
+
 if __name__ == "__main__":
     plot_kernel_speedups()
     plot_sparse_mla_decode_scaling()
     plot_prefill_chunk_breakdown()
     plot_e2e_production()
+    plot_8gpu_tp4pp2_scaling()
