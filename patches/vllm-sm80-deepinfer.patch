@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
-index 102d216..75680bc 100644
+index 102d2161e1..75680bc207 100644
 --- a/vllm/model_executor/kernels/mhc/tilelang.py
 +++ b/vllm/model_executor/kernels/mhc/tilelang.py
 @@ -1013,6 +1013,271 @@ def _mhc_fused_post_pre_tilelang_fake(
@@ -288,7 +288,7 @@ index 102d216..75680bc 100644
  direct_register_custom_op(
      op_name="hc_head_fused_kernel_tilelang",
 diff --git a/vllm/model_executor/kernels/mhc/warmup.py b/vllm/model_executor/kernels/mhc/warmup.py
-index 6a42ca6..bfe0804 100644
+index 6a42ca6222..bfe0804db4 100644
 --- a/vllm/model_executor/kernels/mhc/warmup.py
 +++ b/vllm/model_executor/kernels/mhc/warmup.py
 @@ -43,16 +43,21 @@ class MHCPreNormKernel(VllmJitKernel["MHCPreNormKernel.CompileKey"]):
@@ -321,8 +321,443 @@ index 6a42ca6..bfe0804 100644
          return self._trace_dispatch(self.dispatch)(n_splits=splits, **fields)
  
      def compile(self, compile_key: CompileKey) -> None:
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index a59566afeb..3d7326273e 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -47,6 +47,11 @@ from vllm.v1.attention.ops.mqa_logits_triton import (
+     fp8_mqa_logits_triton,
+     fp8_paged_mqa_logits_triton,
+ )
++from vllm.v1.attention.ops.mqa_logits_candidates_triton import (
++    candidate_topk_decode,
++    candidate_topk_prefill,
++    use_candidate_logits,
++)
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ logger = init_logger(__name__)
+@@ -612,6 +617,29 @@ def sparse_attn_indexer(
+                         cu_seqlen_ke,
+                         clean_logits=False,
+                     )
++                elif dcp_world_size <= 1 and use_candidate_logits(
++                    candidate_blocks,
++                    candidate_write,
++                    candidate_block_size,
++                    k_quant_cast.shape[0],
++                ):
++                    # SM80 Triton fallback, V4.1 candidate consumer (layers
++                    # 24/28/32/36): score only the candidate blocks layer 20
++                    # published instead of all N packed columns and then
++                    # masking; same top-k set, ~N / (topk_blocks*block)
++                    # less work. Writes topk_indices directly.
++                    candidate_topk_prefill(
++                        q_slice_cast,
++                        (k_quant_cast, k_scale_cast),
++                        weights[chunk.token_start : chunk.token_end],
++                        cu_seqlen_ks,
++                        cu_seqlen_ke,
++                        candidate_blocks[chunk.token_start : chunk.token_end],
++                        candidate_block_size,
++                        topk_indices,
++                        topk_tokens,
++                    )
++                    logits = q_slice_cast.new_empty((0, 0), dtype=torch.float32)
+                 elif _DSV4_LOGITS_ROW_CHUNK > 0 and dcp_world_size <= 1:
+                     # SM80 Triton fallback, row-chunked. The [M, N] float32
+                     # logits transient is the indexer's largest allocation and
+@@ -831,6 +859,16 @@ def sparse_attn_indexer(
+                 clean_logits=False,
+                 indices=decode_metadata.indices,
+             )
++        elif use_candidate_logits(
++            candidate_blocks,
++            candidate_write,
++            candidate_block_size,
++            decode_metadata.max_seq_len,
++        ):
++            # SM80 Triton fallback, V4.1 candidate consumer: compact
++            # [rows, topk_blocks*block] scoring straight from the paged
++            # cache; top-k written below, no full-width logits.
++            logits = None
+         else:
+             # SM80/SM121 Triton fallback. Downstream topk reads only up to
+             # `seq_lens`, so size the buffer in the same compressed indexer
+@@ -845,94 +883,107 @@ def sparse_attn_indexer(
+                 max_model_len=active_max_model_len,
+                 clean_logits=False,
+             )
+-        num_rows = logits.shape[0]
+-        if candidate_blocks is not None:
+-            # Two-level selection (v4.1) on the decode logits; columns are
+-            # request-local compressed positions. seq_lens is (B, next_n)
+-            # for native spec decode (per-row effective lens) and (B, 1)
+-            # otherwise.
+-            vis = seq_lens.reshape(-1)
+-            row_repeat = next_n if vis.numel() != num_rows else 1
+-            vis = vis[:num_rows]
+-            decode_candidates = candidate_blocks[:num_rows]
+-            if candidate_write:
+-                _select_candidate_blocks(
+-                    logits,
+-                    None,
+-                    vis,
+-                    decode_candidates.shape[1],
+-                    candidate_block_size,
+-                    decode_candidates,
+-                    row_repeat,
+-                )
+-            else:
+-                _apply_candidate_mask(
+-                    logits,
+-                    None,
+-                    vis,
+-                    decode_candidates,
+-                    candidate_block_size,
+-                    row_repeat,
+-                )
+         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+-
+-        use_cooperative_topk = (
+-            current_platform.is_cuda()
+-            and topk_tokens in (512, 1024, 2048)
+-            and num_rows <= 64
+-            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
+-            and current_platform.has_device_capability(90)
+-            and not current_platform.is_device_capability_family(120)
+-        )
+-        # Deliberately NOT capability-gated, unlike the cooperative path
+-        # above: persistent_topk is the portable non-cluster kernel, and an
+-        # external report of k<n<2k corruption on SM8x (#50576) did not
+-        # reproduce here — 183/183 direct kernel checks and 2x 286/286
+-        # end-to-end, audited 2026-08-03 (the reporter ran a third-party
+-        # vendored kernel, not this tree's topk.cu). Regression coverage:
+-        # tests/kernels/test_persistent_topk_band.py.
+-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
+-            512,
+-            1024,
+-            2048,
+-        )
+-        if use_cooperative_topk:
+-            workspace_manager = current_workspace_manager()
+-            (topk_workspace,) = workspace_manager.get_simultaneous(
+-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+-            )
+-            torch.ops._C.cooperative_topk(
+-                logits,
+-                seq_lens,
+-                topk_indices,
+-                topk_workspace,
+-                topk_tokens,
+-                attn_metadata_narrowed.max_seq_len,
+-            )
+-        elif use_persistent_topk:
+-            workspace_manager = current_workspace_manager()
+-            (topk_workspace,) = workspace_manager.get_simultaneous(
+-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+-            )
+-            torch.ops._C.persistent_topk(
+-                logits,
++        if logits is None:
++            assert candidate_blocks is not None
++            candidate_topk_decode(
++                padded_q_quant_cast,
++                kv_cache,
++                weights[:num_padded_tokens],
+                 seq_lens,
++                decode_metadata.block_table,
++                candidate_blocks[:num_padded_tokens],
++                candidate_block_size,
+                 topk_indices,
+-                topk_workspace,
+                 topk_tokens,
+-                logits.shape[1],
+             )
+         else:
+-            ops.top_k_per_row_decode(
+-                logits,
+-                next_n,
+-                seq_lens,
+-                topk_indices,
+-                num_rows,
+-                logits.stride(0),
+-                logits.stride(1),
+-                topk_tokens,
++            num_rows = logits.shape[0]
++            if candidate_blocks is not None:
++                # Two-level selection (v4.1) on the decode logits; columns are
++                # request-local compressed positions. seq_lens is (B, next_n)
++                # for native spec decode (per-row effective lens) and (B, 1)
++                # otherwise.
++                vis = seq_lens.reshape(-1)
++                row_repeat = next_n if vis.numel() != num_rows else 1
++                vis = vis[:num_rows]
++                decode_candidates = candidate_blocks[:num_rows]
++                if candidate_write:
++                    _select_candidate_blocks(
++                        logits,
++                        None,
++                        vis,
++                        decode_candidates.shape[1],
++                        candidate_block_size,
++                        decode_candidates,
++                        row_repeat,
++                    )
++                else:
++                    _apply_candidate_mask(
++                        logits,
++                        None,
++                        vis,
++                        decode_candidates,
++                        candidate_block_size,
++                        row_repeat,
++                    )
++            use_cooperative_topk = (
++                current_platform.is_cuda()
++                and topk_tokens in (512, 1024, 2048)
++                and num_rows <= 64
++                and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
++                and current_platform.has_device_capability(90)
++                and not current_platform.is_device_capability_family(120)
++            )
++            # Deliberately NOT capability-gated, unlike the cooperative path
++            # above: persistent_topk is the portable non-cluster kernel, and an
++            # external report of k<n<2k corruption on SM8x (#50576) did not
++            # reproduce here — 183/183 direct kernel checks and 2x 286/286
++            # end-to-end, audited 2026-08-03 (the reporter ran a third-party
++            # vendored kernel, not this tree's topk.cu). Regression coverage:
++            # tests/kernels/test_persistent_topk_band.py.
++            use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
++                512,
++                1024,
++                2048,
+             )
++            if use_cooperative_topk:
++                workspace_manager = current_workspace_manager()
++                (topk_workspace,) = workspace_manager.get_simultaneous(
++                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++                )
++                torch.ops._C.cooperative_topk(
++                    logits,
++                    seq_lens,
++                    topk_indices,
++                    topk_workspace,
++                    topk_tokens,
++                    attn_metadata_narrowed.max_seq_len,
++                )
++            elif use_persistent_topk:
++                workspace_manager = current_workspace_manager()
++                (topk_workspace,) = workspace_manager.get_simultaneous(
++                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++                )
++                torch.ops._C.persistent_topk(
++                    logits,
++                    seq_lens,
++                    topk_indices,
++                    topk_workspace,
++                    topk_tokens,
++                    logits.shape[1],
++                )
++            else:
++                ops.top_k_per_row_decode(
++                    logits,
++                    next_n,
++                    seq_lens,
++                    topk_indices,
++                    num_rows,
++                    logits.stride(0),
++                    logits.stride(1),
++                    topk_tokens,
++                )
+ 
+         if decode_metadata.global_seq_lens is not None:
+             _merge_dcp_topk_global(
+@@ -1090,6 +1141,18 @@ class SparseAttnIndexer(CustomOp):
+                     warmup_fp8_paged_mqa_logits_triton(
+                         num_heads, head_dim, kernel_block_size, device
+                     )
++                if candidate_blocks is not None and not candidate_write:
++                    from vllm.v1.attention.ops.mqa_logits_candidates_triton import (
++                        warmup_candidate_logits_triton,
++                    )
++
++                    warmup_candidate_logits_triton(
++                        num_heads,
++                        head_dim,
++                        candidate_block_size,
++                        sorted(block_sizes),
++                        device,
++                    )
+ 
+     @property
+     def cp_kv_cache_interleave_size(self) -> int:
+diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
+index 96c0ae2afa..c2135b31c6 100644
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -9,6 +9,7 @@ import glob
+ import hashlib
+ import json
+ import os
++import struct
+ import tempfile
+ import threading
+ import time
+@@ -847,6 +848,58 @@ def _skip_registered_weight(name: str) -> bool:
+     return bool(_SKIP_WEIGHT_NAMES) and name in _SKIP_WEIGHT_NAMES
+ 
+ 
++_SAFETENSORS_DTYPES = {
++    "BF16": torch.bfloat16,
++    "F16": torch.float16,
++    "F32": torch.float32,
++    "F64": torch.float64,
++    "I8": torch.int8,
++    "U8": torch.uint8,
++    "I16": torch.int16,
++    "I32": torch.int32,
++    "I64": torch.int64,
++    "BOOL": torch.bool,
++    "F8_E4M3": torch.float8_e4m3fn,
++    "F8_E5M2": torch.float8_e5m2,
++    "F8_E8M0": getattr(torch, "float8_e8m0fnu", torch.uint8),
++}
++
++
++def _safetensors_header(st_file: str) -> tuple[dict, int]:
++    """(header dict, byte offset of the data section) without mapping the file."""
++    with open(st_file, "rb") as f:
++        (header_len,) = struct.unpack("<Q", f.read(8))
++        header = json.loads(f.read(header_len))
++    header.pop("__metadata__", None)
++    return header, 8 + header_len
++
++
++def _read_tensors_without_mmap(
++    st_file: str, header: dict, data_start: int, names: list[str]
++) -> Generator[tuple[str, torch.Tensor], None, None]:
++    """Read selected tensors with plain ``pread``.
++
++    ``safe_open`` maps the whole file privately through PyTorch's
++    MapAllocator; for a shard that is mostly one huge skipped tensor (the
++    98 GiB DeepSeek V4.1 Engram tables) that mapping is refused by the
++    kernel's overcommit heuristic on hosts with less RAM+swap than the
++    file, even though none of it would ever be touched.
++    """
++    with open(st_file, "rb") as f:
++        for name in names:
++            meta = header[name]
++            start, end = meta["data_offsets"]
++            f.seek(data_start + start)
++            buf = f.read(end - start)
++            dtype = _SAFETENSORS_DTYPES[meta["dtype"]]
++            tensor = (
++                torch.frombuffer(bytearray(buf), dtype=torch.uint8)
++                .view(dtype)
++                .reshape(meta["shape"])
++            )
++            yield name, tensor
++
++
+ def safetensors_weights_iterator(
+     hf_weights_files: list[str],
+     use_tqdm_on_load: bool,
+@@ -981,6 +1034,19 @@ def safetensors_weights_iterator(
+                 )
+             yield from unflattened_state_dict.items()
+         else:
++            if _SKIP_WEIGHT_NAMES:
++                header, data_start = _safetensors_header(st_file)
++                if any(_skip_registered_weight(n) for n in header):
++                    wanted = [
++                        n
++                        for n in header
++                        if not _skip_registered_weight(n)
++                        and not should_skip_weight(n, local_expert_ids)
++                    ]
++                    yield from _read_tensors_without_mmap(
++                        st_file, header, data_start, wanted
++                    )
++                    continue
+             with safe_open(st_file, framework="pt") as f:
+                 for name in f.keys():  # noqa: SIM118
+                     if should_skip_weight(name, local_expert_ids):
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index ca3cf7c2a0..14c0302c87 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -145,32 +145,7 @@ class DSparkMarkovHead(nn.Module):
+         return logits.scatter_(1, index, corrected.squeeze(-1))
+ 
+ 
+-class DSparkConfidenceHead(nn.Module):
+-    """DSpark acceptance-confidence head."""
+ 
+-    def __init__(
+-        self,
+-        input_dim: int,
+-        prefix: str,
+-        bias: bool = False,
+-        with_markov: bool = True,
+-    ) -> None:
+-        super().__init__()
+-        self.with_markov = with_markov
+-        self.proj = ReplicatedLinear(
+-            input_dim,
+-            1,
+-            bias=bias,
+-            return_bias=False,
+-            params_dtype=torch.float32,
+-            prefix=maybe_prefix(prefix, "proj"),
+-        )
+-
+-    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
+-        x = (
+-            torch.cat([hidden, markov_embed], dim=-1) if self.with_markov else hidden
+-        ).float()
+-        return self.proj(x).squeeze(-1)
+     def select_top_tokens(
+         self,
+         markov_embed: torch.Tensor,
+@@ -232,6 +207,35 @@ class DSparkConfidenceHead(nn.Module):
+         )
+ 
+ 
++class DSparkConfidenceHead(nn.Module):
++    """DSpark acceptance-confidence head."""
++
++    def __init__(
++        self,
++        input_dim: int,
++        prefix: str,
++        bias: bool = False,
++        with_markov: bool = True,
++    ) -> None:
++        super().__init__()
++        self.with_markov = with_markov
++        self.proj = ReplicatedLinear(
++            input_dim,
++            1,
++            bias=bias,
++            return_bias=False,
++            params_dtype=torch.float32,
++            prefix=maybe_prefix(prefix, "proj"),
++        )
++
++    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
++        x = (
++            torch.cat([hidden, markov_embed], dim=-1) if self.with_markov else hidden
++        ).float()
++        return self.proj(x).squeeze(-1)
++
++
++
+ class Qwen3DSparkModel(DFlashQwen3Model):
+     """DFlash Qwen3 backbone + DSpark Markov / confidence heads."""
+ 
 diff --git a/vllm/models/deepseek_v4_1/amd/rocm.py b/vllm/models/deepseek_v4_1/amd/rocm.py
-index 9271e7a..7e4be42 100644
+index 9271e7ae5a..7e4be42107 100644
 --- a/vllm/models/deepseek_v4_1/amd/rocm.py
 +++ b/vllm/models/deepseek_v4_1/amd/rocm.py
 @@ -109,20 +109,27 @@ def _combine_topk_swa_indices_kernel(
@@ -684,8 +1119,412 @@ index 9271e7a..7e4be42 100644
 +                ragged_indices=ragged_indices,
 +                ragged_indptr=ragged_indptr,
              )
+diff --git a/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py b/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+index 464aacbfcd..957e75c4ba 100644
+--- a/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
++++ b/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+@@ -24,9 +24,19 @@ honoured by ``ModelOptLinearMethod.process_weights_after_loading``).
+ 
+ from vllm.models.deepseek_v4_1.amd.rocm import (
+     DeepseekV4ROCMAiterMLASparseBackend,
++    DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
+     DeepseekV41ROCMAiterMLAAttention,
++    DeepseekV41ROCMAiterSparseSWABackend,
+ )
+ from vllm.platforms.interface import DeviceCapability
++from vllm.v1.attention.backends.mla.sparse_swa import (
++    _LAYER_TYPE_C1A,
++    _LAYER_TYPE_C2A,
++    _LAYER_TYPE_C4A,
++    _LAYER_TYPE_C128A,
++    _LAYER_TYPE_SWAONLY,
++    FlashMLASchedMeta,
++)
+ 
+ 
+ class DeepseekV41AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
+@@ -39,10 +49,37 @@ class DeepseekV41AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
+         return capability.major == 8
+ 
+ 
++class DeepseekV41AmpereSparseSWAMetadataBuilder(
++    DeepseekV4ROCMAiterSparseSWAMetadataBuilder
++):
++    def build_tile_scheduler(
++        self, num_decode_tokens: int
++    ) -> dict[str, FlashMLASchedMeta | None]:
++        # The base builder plans FlashMLA tile schedules for every layer type
++        # on CUDA; the ragged Triton decode never calls FlashMLA (which is
++        # not even compiled for sm_80), so skip the planner entirely.
++        return dict.fromkeys(
++            (
++                _LAYER_TYPE_SWAONLY,
++                _LAYER_TYPE_C4A,
++                _LAYER_TYPE_C128A,
++                _LAYER_TYPE_C1A,
++                _LAYER_TYPE_C2A,
++            )
++        )
++
++
++class DeepseekV41AmpereSparseSWABackend(DeepseekV41ROCMAiterSparseSWABackend):
++    @staticmethod
++    def get_builder_cls() -> type["DeepseekV41AmpereSparseSWAMetadataBuilder"]:
++        return DeepseekV41AmpereSparseSWAMetadataBuilder
++
++
+ class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
+     """SM8x DeepSeek V4.1 attention: ROCm Triton path on CUDA Ampere."""
+ 
+     backend_cls = DeepseekV41AmpereMLASparseBackend
++    swa_backend_cls = DeepseekV41AmpereSparseSWABackend
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 77e98a376e..e0f56d6fc3 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1113,6 +1113,8 @@ class DeepseekV4Indexer(nn.Module):
+             self.max_model_len,
+             self.max_total_seq_len,
+             self.topk_indices_buffer,
++            # The SM8x fork's Triton indexer warms its kernels per head count.
++            num_heads=self.n_head,
+             skip_k_cache_insert=True,
+             use_fp4_cache=self.use_fp4_kv,
+             compress_ratio=self.compress_ratio,
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index ac2886c7a0..61f00207cb 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -35,10 +35,12 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
+ """
+ 
+ import concurrent.futures
++import functools
+ import json
+ import os
+ import re
+ import struct
++import time
+ import weakref
+ 
+ import numpy as np
+@@ -640,6 +642,109 @@ def _hf_engram_prefix(prefix: str) -> str:
+     return m.group(1)
+ 
+ 
++_ENGRAM_PREAD_C = r"""
++#include <pthread.h>
++#include <stdint.h>
++#include <unistd.h>
++
++typedef struct {
++    int fd_w, fd_s;
++    int64_t base_w, base_s;
++    const int64_t *rows;
++    int64_t lo, hi;
++    uint8_t *vals, *scales;
++    int dim, sdim;
++    int64_t short_reads;
++} job_t;
++
++static void *worker(void *arg) {
++    job_t *j = (job_t *)arg;
++    for (int64_t i = j->lo; i < j->hi; i++) {
++        int64_t r = j->rows[i];
++        ssize_t a = pread(j->fd_w, j->vals + i * j->dim, j->dim, j->base_w + r * j->dim);
++        ssize_t b = pread(j->fd_s, j->scales + i * j->sdim, j->sdim, j->base_s + r * j->sdim);
++        if (a != j->dim || b != j->sdim) j->short_reads++;
++    }
++    return NULL;
++}
++
++/* Gather rows[0..n) of a (values, scales) table with `threads` pthreads.
++   Returns the number of short/failed reads (0 = success). */
++int64_t engram_gather(int fd_w, int fd_s, int64_t base_w, int64_t base_s,
++                      const int64_t *rows, int64_t n, uint8_t *vals,
++                      uint8_t *scales, int dim, int sdim, int threads) {
++    if (n <= 0) return 0;
++    if (threads < 1) threads = 1;
++    if (threads > n) threads = (int)n;
++    pthread_t tid[256];
++    job_t jobs[256];
++    if (threads > 256) threads = 256;
++    int64_t per = (n + threads - 1) / threads;
++    int started = 0;
++    for (int t = 0; t < threads; t++) {
++        int64_t lo = t * per, hi = lo + per > n ? n : lo + per;
++        if (lo >= hi) break;
++        jobs[t] = (job_t){fd_w, fd_s, base_w, base_s, rows, lo, hi, vals, scales, dim, sdim, 0};
++        if (pthread_create(&tid[t], NULL, worker, &jobs[t]) != 0) {
++            worker(&jobs[t]);
++            continue;
++        }
++        started = t + 1;
++    }
++    int64_t bad = 0;
++    for (int t = 0; t < started; t++) {
++        pthread_join(tid[t], NULL);
++        bad += jobs[t].short_reads;
++    }
++    return bad;
++}
++"""
++
++
++@functools.cache
++def _engram_pread_lib():
++    """Compile (once per host, cached on disk) and load the C gather helper.
++
++    The Python ``preadv`` loop caps at ~125k syscalls/s regardless of thread
++    count (per-call interpreter overhead under the GIL), which made a
++    4096-token prefill chunk cost 1.6 s on the ranks owning an Engram layer
++    and capped prefill at ~2.5k tok/s. The C loop issues the same reads
++    from pthreads with the GIL released.
++    """
++    import ctypes
++    import hashlib
++    import subprocess
++    import tempfile
++
++    cache_dir = os.path.join(
++        os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm")),
++        "engram_pread",
++    )
++    os.makedirs(cache_dir, exist_ok=True)
++    digest = hashlib.sha256(_ENGRAM_PREAD_C.encode()).hexdigest()[:16]
++    so_path = os.path.join(cache_dir, f"engram_pread_{digest}.so")
++    if not os.path.exists(so_path):
++        with tempfile.TemporaryDirectory() as tmp:
++            src = os.path.join(tmp, "engram_pread.c")
++            with open(src, "w") as f:
++                f.write(_ENGRAM_PREAD_C)
++            out = os.path.join(tmp, "engram_pread.so")
++            subprocess.run(
++                ["gcc", "-O2", "-shared", "-fPIC", "-pthread", src, "-o", out],
++                check=True,
++                capture_output=True,
++            )
++            os.replace(out, so_path)
++    lib = ctypes.CDLL(so_path)
++    lib.engram_gather.restype = ctypes.c_int64
++    lib.engram_gather.argtypes = [
++        ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
++        ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p,
++        ctypes.c_int, ctypes.c_int, ctypes.c_int,
++    ]
++    return lib
++
++
+ class _DiskEngramTable:
+     """Rows of one engram table gathered straight from the safetensors shard.
+ 
+@@ -696,11 +801,16 @@ class _DiskEngramTable:
+         # rows per lookup (batch tokens x local hash columns). ~26 MiB each
+         # at 4096 x 24 rows.
+         self.capacity = max(1, staging_rows)
++        # Explicit device: model init runs under a ``torch.device("cuda")``
++        # context, under which a bare ``torch.empty`` is not a CPU tensor.
+         self.host_vals = torch.empty(
+-            (self.capacity, dim), dtype=torch.uint8, pin_memory=True
++            (self.capacity, dim), dtype=torch.uint8, device="cpu", pin_memory=True
+         )
+         self.host_scales = torch.empty(
+-            (self.capacity, self.scale_dim), dtype=torch.uint8, pin_memory=True
++            (self.capacity, self.scale_dim),
++            dtype=torch.uint8,
++            device="cpu",
++            pin_memory=True,
+         )
+         self.dev_vals = torch.empty((self.capacity, dim), dtype=torch.uint8, device=device)
+         self.dev_scales = torch.empty(
+@@ -709,6 +819,14 @@ class _DiskEngramTable:
+         self._np_vals = self.host_vals.numpy()
+         self._np_scales = self.host_scales.numpy()
+         self._pool = concurrent.futures.ThreadPoolExecutor(self.num_threads)
++        try:
++            self._lib = _engram_pread_lib()
++        except Exception as e:  # noqa: BLE001
++            logger.warning(
++                "engram disk gather: C helper unavailable (%s); using the slower "
++                "Python thread pool", e
++            )
++            self._lib = None
+         logger.info(
+             "Engram table %s served from disk (%s, %.1f GiB never loaded); "
+             "%d reader threads, staging %d rows",
+@@ -767,6 +885,18 @@ class _DiskEngramTable:
+         if n == 0:
+             return
+         wfd, sfd = self._fd(self.weight_path), self._fd(self.scale_path)
++        lib = self._lib
++        if lib is not None:
++            rows64 = np.ascontiguousarray(rows, dtype=np.int64)
++            bad = lib.engram_gather(
++                wfd, sfd, self.weight_base, self.scale_base,
++                rows64.ctypes.data, n,
++                self._np_vals.ctypes.data, self._np_scales.ctypes.data,
++                self.dim, self.scale_dim, self.num_threads,
++            )
++            if bad:
++                raise RuntimeError(f"engram disk gather: {bad} short reads")
++            return
+         vals, scales = self._np_vals, self._np_scales
+         dim, sdim = self.dim, self.scale_dim
+         wbase, sbase = self.weight_base, self.scale_base
+@@ -808,6 +938,24 @@ class _DiskEngramTable:
+         return self.dev_vals, self.dev_scales, inv_dev, n
+ 
+ 
++def _pinned_exact(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
++    """A CPU tensor pinned at its exact size (cudaHostRegister on a plain
++    allocation), bypassing the caching host allocator's power-of-two rounding.
++    Registered memory is page-locked and UVA-addressable like cudaHostAlloc
++    memory (``is_pinned()`` is true, ``get_cuda_view_from_cpu_tensor`` works).
++    Never unregistered: the tables live for the whole process."""
++    t = torch.empty(shape, dtype=dtype, device="cpu")
++    nbytes = t.numel() * t.element_size()
++    if nbytes:
++        err = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, 0)
++        if int(err) != 0:
++            raise RuntimeError(
++                f"cudaHostRegister of {nbytes / 1024**3:.1f} GiB failed with {err}"
++            )
++        assert t.is_pinned()
++    return t
++
++
+ class ParallelEngramEmbedding(nn.Module):
+     """The n-gram hash table, sharded by complete hash heads over TP ranks.
+     Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
+@@ -892,24 +1040,49 @@ class ParallelEngramEmbedding(nn.Module):
+             return
+         self.disk = None
+ 
++        # cpu mode: the generic loader would materialise the whole 98 GiB
++        # table in host RAM (safe_open().get_tensor copies) before copy_()
++        # into the pinned parameter -- ~200 GiB per table at peak, which is
++        # what OOM-killed the workers on a 278 GB host. Skip the tensors in
++        # the loader and fill the pinned buffers straight from the shard in
++        # chunks after loading (fill_pinned_from_checkpoint).
++        self._pinned_fill: tuple[str, str] | None = None
++        if cpu_offload and hf_prefix is not None:
++            from vllm.model_executor.model_loader.weight_utils import (
++                register_skip_weight_names,
++            )
++
++            register_skip_weight_names(
++                [f"{hf_prefix}.embed.weight", f"{hf_prefix}.embed.scale"]
++            )
++            self._pinned_fill = (get_current_vllm_config().model_config.model, hf_prefix)
++
+         # Explicit device: model init runs under a `torch.device("cuda")`
+-        # context, which would otherwise put the shard in HBM.
+-        kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
+-        self.weight = nn.Parameter(
+-            torch.empty(
+-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
+-            ),
+-            requires_grad=False,
+-        )
+-        self.weight_scale_inv = nn.Parameter(
+-            torch.empty(
+-                self.part_num_embeddings,
+-                dim // block_size,
+-                dtype=torch.uint8,
+-                **kwargs,
+-            ),
+-            requires_grad=False,
+-        )
++        # context, which would otherwise put the shard in HBM. In cpu mode
++        # the buffers are pinned with cudaHostRegister at their exact size:
++        # torch's pinned allocator rounds every block up to a power of two,
++        # which turns a 98.3 GB table into a 128 GiB pinned block (the two
++        # tables would need 264 GiB of host memory before anything else).
++        if cpu_offload:
++            self.weight = nn.Parameter(
++                _pinned_exact((self.part_num_embeddings, dim), torch.float8_e4m3fn),
++                requires_grad=False,
++            )
++            self.weight_scale_inv = nn.Parameter(
++                _pinned_exact((self.part_num_embeddings, dim // block_size), torch.uint8),
++                requires_grad=False,
++            )
++        else:
++            self.weight = nn.Parameter(
++                torch.empty(self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn),
++                requires_grad=False,
++            )
++            self.weight_scale_inv = nn.Parameter(
++                torch.empty(
++                    self.part_num_embeddings, dim // block_size, dtype=torch.uint8
++                ),
++                requires_grad=False,
++            )
+         for param in (self.weight, self.weight_scale_inv):
+             set_weight_attrs(
+                 param,
+@@ -927,6 +1100,56 @@ class ParallelEngramEmbedding(nn.Module):
+                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+             )
+ 
++    def needs_checkpoint_fill(self) -> bool:
++        return self._pinned_fill is not None
++
++    def fill_pinned_from_checkpoint(self, threads: int = 8) -> None:
++        """Read this rank's rows of the two table tensors from the safetensors
++        shard straight into the pinned parameters (chunked ``preadv``, no
++        intermediate copy). The page cache the reads leave behind is
++        evictable, so the only resident cost is the parameters themselves."""
++        assert self._pinned_fill is not None
++        model_path, hf_prefix = self._pinned_fill
++        t0 = time.perf_counter()
++        for key, param, width, dtype in (
++            (f"{hf_prefix}.embed.weight", self.weight, self.dim, "F8_E4M3"),
++            (
++                f"{hf_prefix}.embed.scale",
++                self.weight_scale_inv,
++                self.dim // self.block_size,
++                "F8_E8M0",
++            ),
++        ):
++            path, base = _DiskEngramTable._locate(
++                model_path, key, (self.num_embeddings, width), dtype
++            )
++            dst = param.data.view(torch.uint8).reshape(-1).numpy()
++            nbytes = dst.nbytes
++            assert nbytes == self.part_num_embeddings * width
++            start = base + self.vocab_start_idx * width
++            step = 256 << 20
++            fd = os.open(path, os.O_RDONLY)
++            try:
++
++                def read_chunk(off: int) -> None:
++                    end = min(off + step, nbytes)
++                    view = memoryview(dst)[off:end]
++                    pos = 0
++                    while pos < end - off:
++                        pos += os.preadv(fd, [view[pos:]], start + off + pos)
++
++                with concurrent.futures.ThreadPoolExecutor(threads) as pool:
++                    list(pool.map(read_chunk, range(0, nbytes, step)))
++            finally:
++                os.close(fd)
++        self._pinned_fill = None
++        logger.info(
++            "Engram table %s: %.1f GiB read into pinned host memory in %.0f s",
++            hf_prefix,
++            (self.weight.numel() + self.weight_scale_inv.numel()) / 1024**3,
++            time.perf_counter() - t0,
++        )
++
+     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
+         """Parameters when resident, else cached UVA views of the pinned shard.
+ 
 diff --git a/vllm/models/deepseek_v4_1/common/ops/cache_utils.py b/vllm/models/deepseek_v4_1/common/ops/cache_utils.py
-index 7b83825..4cc093f 100644
+index 7b838252f5..4cc093f9d7 100644
 --- a/vllm/models/deepseek_v4_1/common/ops/cache_utils.py
 +++ b/vllm/models/deepseek_v4_1/common/ops/cache_utils.py
 @@ -34,7 +34,12 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
@@ -895,8 +1734,37 @@ index 7b83825..4cc093f 100644
  
      if compressed_block_table is None:
          compressed_block_table = swa_block_table
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 46fe2558ab..0a00dae15c 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -367,6 +367,24 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         # Full-vocab draft: base logits, no d2t scatter.
+         return self.compute_logits(hidden_states)
+ 
++    def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        # Same logits, this rank's vocab columns only (no gather). The norm is
++        # part of the head, so it stays on this side of the split.
++        return self.logits_processor.get_shard_logits(
++            self.lm_head, self.model.norm(hidden_states)
++        )
++
++    def select_draft_token_shard(
++        self, markov_embed: torch.Tensor, base_shard_logits: torch.Tensor
++    ) -> torch.Tensor:
++        return self.model.markov_head.select_top_tokens(
++            markov_embed, base_shard_logits, self.logits_processor
++        )
++
++    def markov_fusion_operands(self):
++        return self.model.markov_head.fusion_operands(self.logits_processor)
++
++
+     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+         return draft_ids  # full-vocab: draft ids are target ids
+ 
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index 16f7400..6df44ca 100644
+index 16f7400888..6df44cad6a 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model.py
 @@ -19,6 +19,7 @@ from vllm.distributed import (
@@ -1210,8 +2078,1106 @@ index 16f7400..6df44ca 100644
          self.process_weights_after_loading()
          return loaded_params
  
+diff --git a/vllm/models/deepseek_v4_1/nvidia/vl_model.py b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+index 111936b431..016524fc50 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+@@ -118,6 +118,9 @@ def _make_deepseek_v4_vl_weights_mapper(
+     dummy_inputs=DeepseekV4VLDummyInputsBuilder,
+ )
+ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsEagle3):
++    # Under PP every rank's decoder layers read token ids (MoE image-sentinel
++    # routing, Engram hashing); see model_runner's non-first-rank inputs.
++    pp_requires_input_ids = True
+     """Multimodal entry point for DeepSeek-V4.1 checkpoints with a vision tower.
+ 
+     ``SupportsEagle3`` (aux hidden-state plumbing for MTP/DSpark drafters)
+diff --git a/vllm/models/deepseek_v4_1/pp_share.py b/vllm/models/deepseek_v4_1/pp_share.py
+new file mode 100644
+index 0000000000..5614153c0d
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/pp_share.py
+@@ -0,0 +1,452 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Pipeline parallelism across DeepSeek V4.1's shared caches.
++
++V4.1 shares state across layers: every layer with ``compress_ratio > 0`` reads
++the compressed KV cache of the nearest ``kv_source_layer_ids`` entry below
++it, non-owning index sources read that source's indexer K cache, the
++``candidate_source_layer_id`` indexer publishes candidate blocks for every
++later indexer, and each index source publishes top-k indices for the layers
++up to the next one. Upstream only supports this when a whole sharing group
++sits on one PP rank -- impossible here, because layer 20's group is the
++last 20 layers of the model.
++
++This module makes any partition legal by *replicating* the shared state on
++the ranks that need it:
++
++* A downstream rank that hosts consumers of source ``S`` (but not ``S``)
++  registers a :class:`CompressedKVReplica` under ``S``'s exact layer name
++  (and a :class:`DeepseekV4IndexerCache` under ``S``'s indexer K cache name).
++  They declare the same KV cache spec as the source, so the KV cache
++  manager gives them the same block tables and slot mappings, and the
++  consumer layers resolve their sources through the forward context exactly
++  as they do on the source rank.
++* Every step, the rows the source wrote for the current tokens (584 bytes
++  per compressed state, 132 bytes per indexer key) are gathered by slot and
++  shipped downstream inside the pipeline's ``IntermediateTensors``, along
++  with the candidate-block and top-k rows of the batch when a boundary
++  splits their consumers. Each receiving rank scatters the rows into its
++  replicas before running its layers and re-gathers them for the next hop,
++  so the data crosses as many boundaries as the sharing group does.
++
++Per 4096-token prefill chunk this is ~2.4 MB of compressed rows, ~0.5 MB
++of index keys, 32 MB of candidate blocks and 8 MB of top-k indices per hop.
++"""
++
++from dataclasses import dataclass, field
++
++import torch
++from torch import nn
++
++from vllm.config import VllmConfig
++from vllm.distributed import get_pp_group
++from vllm.distributed.utils import get_pp_indices
++from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
++from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
++from vllm.models.deepseek_v4_1 import attention as _attn
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.backend import AttentionBackend
++from vllm.v1.kv_cache_interface import KVCacheSpec
++
++logger = init_logger(__name__)
++
++# fp8_ds_mla compressed state: 576 bytes of values (448 e4m3 NoPE + 128 bf16
++# RoPE) at ``page + slot_in_block * 576`` and 8 UE8M0 scale bytes at
++# ``page + block_size * 576 + slot_in_block * 8``.
++# tl.constexpr so the @triton.jit kernels below may read them as globals.
++KV_VALUE_BYTES = tl.constexpr(576)
++KV_SCALE_BYTES = tl.constexpr(8)
++KV_ROW_BYTES = tl.constexpr(576 + 8)
++# fp8 indexer key: 128 e4m3 values then one fp32 scale, segregated per block.
++IK_VALUE_BYTES = tl.constexpr(128)
++IK_SCALE_BYTES = tl.constexpr(4)
++IK_ROW_BYTES = tl.constexpr(128 + 4)
++
++
++@triton.jit
++def _kv_rows_kernel(
++    cache,
++    slots,
++    positions,
++    rows,
++    cache_stride,
++    CACHE_BLOCK: tl.constexpr,
++    RATIO: tl.constexpr,
++    GATHER: tl.constexpr,
++):
++    """Copy this token's compressed state between the cache and ``rows[t]``.
++
++    Mirrors ``_rope_quant_insert_kernel``'s write rule: only a slot >= 0 at a
++    group-boundary position holds a state for this step.
++    """
++    t = tl.program_id(0)
++    slot = tl.load(slots + t)
++    if slot < 0:
++        return
++    position = tl.load(positions + t)
++    if (position + 1) % RATIO != 0:
++        return
++    page = cache + (slot // CACHE_BLOCK).to(tl.int64) * cache_stride
++    values = page + (slot % CACHE_BLOCK) * KV_VALUE_BYTES
++    scales = page + CACHE_BLOCK * KV_VALUE_BYTES + (slot % CACHE_BLOCK) * KV_SCALE_BYTES
++    row = rows + t.to(tl.int64) * KV_ROW_BYTES
++    d = tl.arange(0, 1024)
++    dv = d < KV_VALUE_BYTES
++    s = tl.arange(0, 8)
++    if GATHER:
++        tl.store(row + d, tl.load(values + d, dv, other=0), dv)
++        tl.store(row + KV_VALUE_BYTES + s, tl.load(scales + s))
++    else:
++        tl.store(values + d, tl.load(row + d, dv, other=0), dv)
++        tl.store(scales + s, tl.load(row + KV_VALUE_BYTES + s))
++
++
++@triton.jit
++def _ik_rows_kernel(
++    cache,
++    slots,
++    positions,
++    rows,
++    cache_stride,
++    CACHE_BLOCK: tl.constexpr,
++    RATIO: tl.constexpr,
++    GATHER: tl.constexpr,
++):
++    """Same as ``_kv_rows_kernel`` for the fp8 indexer K cache
++    (``_indexer_k_norm_rope_quant_store_kernel``'s non-tiled layout)."""
++    t = tl.program_id(0)
++    slot = tl.load(slots + t)
++    if slot < 0:
++        return
++    position = tl.load(positions + t)
++    if (position + 1) % RATIO != 0:
++        return
++    page = cache + (slot // CACHE_BLOCK).to(tl.int64) * cache_stride
++    values = page + (slot % CACHE_BLOCK) * IK_VALUE_BYTES
++    scales = page + CACHE_BLOCK * IK_VALUE_BYTES + (slot % CACHE_BLOCK) * IK_SCALE_BYTES
++    row = rows + t.to(tl.int64) * IK_ROW_BYTES
++    d = tl.arange(0, IK_VALUE_BYTES)
++    s = tl.arange(0, IK_SCALE_BYTES)
++    if GATHER:
++        tl.store(row + d, tl.load(values + d))
++        tl.store(row + IK_VALUE_BYTES + s, tl.load(scales + s))
++    else:
++        tl.store(values + d, tl.load(row + d))
++        tl.store(scales + s, tl.load(row + IK_VALUE_BYTES + s))
++
++
++def _copy_rows(kernel, cache: torch.Tensor, slots: torch.Tensor,
++               positions: torch.Tensor, rows: torch.Tensor, ratio: int,
++               gather: bool) -> None:
++    num_tokens = positions.shape[0]
++    if num_tokens == 0 or cache.numel() == 0:
++        return
++    # Bound caches are [num_blocks, block_size, bytes]; address them as bytes.
++    assert cache.dtype == torch.uint8, cache.dtype
++    kernel[(num_tokens,)](
++        cache,
++        slots,
++        positions,
++        rows,
++        cache.stride(0),
++        CACHE_BLOCK=cache.shape[1],
++        RATIO=ratio,
++        GATHER=gather,
++        num_warps=1,
++    )
++
++
++class CompressedKVReplica(nn.Module, AttentionLayerBase):
++    """A kv-source attention layer's compressed KV cache on a rank without
++    the layer. Registered under the source's own layer name."""
++
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        prefix: str,
++        compress_ratio: int,
++        head_dim: int,
++        backend_cls: type[AttentionBackend],
++        use_fp8_ds_mla_layout: bool,
++    ) -> None:
++        super().__init__()
++        cache_config = vllm_config.cache_config
++        self.prefix = prefix
++        self.compress_ratio = compress_ratio
++        self.head_dim = head_dim
++        self.backend_cls = backend_cls
++        self.kv_cache_dtype, self.kv_cache_torch_dtype = (
++            _attn._resolve_dsv4_kv_cache_dtype(
++                use_fp8_ds_mla_layout, cache_config.cache_dtype, cache_config
++            )
++        )
++        if self.kv_cache_dtype != "fp8_ds_mla":
++            raise NotImplementedError(
++                "PP replication of DeepSeek V4.1 compressed caches is implemented "
++                f"for the fp8_ds_mla layout only (got {self.kv_cache_dtype})."
++            )
++        self.kv_cache = torch.tensor([])
++        compilation_config = vllm_config.compilation_config
++        if prefix in compilation_config.static_forward_context:
++            raise ValueError(f"Duplicate layer name: {prefix}")
++        compilation_config.static_forward_context[prefix] = self
++
++    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
++        self.kv_cache = kv_cache.squeeze(1)
++
++    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
++        # Byte-identical to DeepseekV4Attention.get_kv_cache_spec for a kv
++        # source: the KV cache manager asserts equality across ranks.
++        return _attn.MLAAttentionSpec(
++            block_size=vllm_config.cache_config.block_size,
++            num_kv_heads=1,
++            head_size=self.head_dim,
++            dtype=torch.uint8,
++            tokens_per_state=self.compress_ratio,
++            cache_dtype_str=self.kv_cache_dtype,
++            alignment=576,
++            model_version="deepseek_v4",
++            kv_quant_mode=_attn.get_kv_quant_mode(self.kv_cache_dtype),
++            state_content_bytes=584,
++        )
++
++    def get_attn_backend(self) -> type[AttentionBackend]:
++        return self.backend_cls
++
++    def forward(self): ...
++
++
++@dataclass
++class _Boundary:
++    """What crosses the hand-off after a rank."""
++
++    kv_sources: list[int] = field(default_factory=list)  # ship compressed rows
++    ik_sources: list[int] = field(default_factory=list)  # ship indexer K rows
++    topk: bool = False
++    cand: bool = False
++
++    def empty(self) -> bool:
++        return not (self.kv_sources or self.ik_sources or self.topk or self.cand)
++
++
++class PPSharePlan:
++    """Per-rank plan: which replicas to host, what to receive, what to send."""
++
++    def __init__(self, vllm_config: VllmConfig) -> None:
++        config = vllm_config.model_config.hf_config
++        pp = get_pp_group()
++        self.pp_rank, self.pp_size = pp.rank_in_group, pp.world_size
++        num_layers = config.num_hidden_layers
++        self.ranges = [get_pp_indices(num_layers, r, self.pp_size) for r in range(self.pp_size)]
++        self.start, self.end = self.ranges[self.pp_rank]
++        ratios = list(getattr(config, "compress_ratios", []) or [])
++        self.ratio = {i: int(ratios[i]) if i < len(ratios) else 0 for i in range(num_layers)}
++        kv_sources = sorted(getattr(config, "kv_source_layer_ids", None) or ())
++        index_sources = sorted(getattr(config, "index_source_layer_ids", None) or ())
++        cand = getattr(config, "candidate_source_layer_id", -1)
++        self.candidate_topk_blocks = getattr(config, "candidate_topk_blocks", 0)
++        self.index_topk = config.index_topk
++        self.index_head_dim = config.index_head_dim
++        self.head_dim = config.head_dim
++
++        def group_end(sources, s):
++            later = [x for x in sources if x > s]
++            return later[0] if later else num_layers
++
++        # Consumers of kv source S: compressed layers in (S, next source).
++        self.kv_consumers = {
++            s: [i for i in range(s + 1, group_end(kv_sources, s)) if self.ratio[i] > 0]
++            for s in kv_sources
++        }
++        # Non-owning index sources read S's indexer K cache.
++        self.ik_consumers = {
++            s: [i for i in index_sources if s < i < group_end(kv_sources, s)]
++            for s in kv_sources
++        }
++        # Layers using index source I's top-k: (I, next index source).
++        self.topk_consumers = {
++            i: [j for j in range(i + 1, group_end(index_sources, i)) if self.ratio[j] > 0]
++            for i in index_sources
++        }
++        self.cand_source = cand
++        self.cand_consumers = [i for i in index_sources if i > cand] if cand >= 0 else []
++
++        self.boundaries: list[_Boundary] = []
++        for r in range(self.pp_size - 1):
++            last = self.ranges[r][1] - 1
++            b = _Boundary()
++            for s in kv_sources:
++                if s <= last and any(c > last for c in self.kv_consumers[s]):
++                    b.kv_sources.append(s)
++                if s <= last and any(c > last for c in self.ik_consumers[s]):
++                    b.ik_sources.append(s)
++            b.topk = any(
++                i <= last and any(c > last for c in self.topk_consumers[i])
++                for i in index_sources
++            )
++            b.cand = (
++                cand >= 0 and cand <= last and any(c > last for c in self.cand_consumers)
++            )
++            self.boundaries.append(b)
++        self.recv_plan = self.boundaries[self.pp_rank - 1] if self.pp_rank > 0 else _Boundary()
++        self.send_plan = (
++            self.boundaries[self.pp_rank] if self.pp_rank < self.pp_size - 1 else _Boundary()
++        )
++        local = range(self.start, self.end)
++        self.replica_kv = [
++            s for s in kv_sources
++            if s not in local and any(c in local for c in self.kv_consumers[s])
++        ]
++        self.replica_ik = [
++            s for s in kv_sources
++            if s not in local and any(c in local for c in self.ik_consumers[s])
++        ]
++        self.replicas: dict[int, CompressedKVReplica] = {}
++        self.ik_replicas: dict[int, _attn.DeepseekV4IndexerCache] = {}
++        self._layers_prefix = ""
++        self._buffers: dict[str, torch.Tensor] = {}
++        logger.info(
++            "DSv4.1 PP share plan rank %d layers [%d, %d): replicas kv=%s ik=%s; "
++            "recv kv=%s ik=%s topk=%s cand=%s; send kv=%s ik=%s topk=%s cand=%s",
++            self.pp_rank, self.start, self.end, self.replica_kv, self.replica_ik,
++            self.recv_plan.kv_sources, self.recv_plan.ik_sources, self.recv_plan.topk, self.recv_plan.cand,
++            self.send_plan.kv_sources, self.send_plan.ik_sources, self.send_plan.topk, self.send_plan.cand,
++        )
++
++    @property
++    def active(self) -> bool:
++        return bool(self.replica_kv or self.replica_ik or not self.recv_plan.empty()
++                    or not self.send_plan.empty())
++
++    # ---- construction --------------------------------------------------
++    def create_replicas(
++        self,
++        vllm_config: VllmConfig,
++        layers_prefix: str,
++        attn_cls: type,
++    ) -> None:
++        """Register the stand-in caches BEFORE the consumer layers are built."""
++        self._layers_prefix = layers_prefix
++        for s in self.replica_kv:
++            self.replicas[s] = CompressedKVReplica(
++                vllm_config,
++                prefix=f"{layers_prefix}.{s}.attn",
++                compress_ratio=self.ratio[s],
++                head_dim=self.head_dim,
++                backend_cls=attn_cls.backend_cls,
++                use_fp8_ds_mla_layout=attn_cls.use_fp8_ds_mla_layout,
++            )
++        for s in self.replica_ik:
++            use_fp4 = _attn.dsa_indexer_uses_fp4(vllm_config)
++            if use_fp4:
++                raise NotImplementedError(
++                    "PP replication of the indexer K cache supports the fp8 "
++                    "layout only."
++                )
++            self.ik_replicas[s] = _attn.DeepseekV4IndexerCache(
++                head_dim=_attn._indexer_k_cache_head_dim(self.index_head_dim, False),
++                dtype=torch.uint8,
++                prefix=f"{layers_prefix}.{s}.attn.indexer.k_cache",
++                cache_config=vllm_config.cache_config,
++                compress_ratio=self.ratio[s],
++            )
++
++    def alloc_buffers(self, max_tokens: int, device: torch.device) -> None:
++        """Persistent send-side staging so captured graphs see stable addresses."""
++        for s in self.send_plan.kv_sources:
++            self._buffers[f"pp_kv{s}"] = torch.zeros(
++                (max_tokens, KV_ROW_BYTES.value), dtype=torch.uint8, device=device
++            )
++        for s in self.send_plan.ik_sources:
++            self._buffers[f"pp_ik{s}"] = torch.zeros(
++                (max_tokens, IK_ROW_BYTES.value), dtype=torch.uint8, device=device
++            )
++
++    def recv_tensors(self, batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
++        """Entries for ``make_empty_intermediate_tensors`` (the incoming layout)."""
++        out: dict[str, torch.Tensor] = {}
++        for s in self.recv_plan.kv_sources:
++            out[f"pp_kv{s}"] = torch.zeros((batch_size, KV_ROW_BYTES.value), dtype=torch.uint8, device=device)
++        for s in self.recv_plan.ik_sources:
++            out[f"pp_ik{s}"] = torch.zeros((batch_size, IK_ROW_BYTES.value), dtype=torch.uint8, device=device)
++        if self.recv_plan.cand:
++            out["pp_cand"] = torch.zeros((batch_size, self.candidate_topk_blocks), dtype=torch.int32, device=device)
++        if self.recv_plan.topk:
++            out["pp_topk"] = torch.zeros((batch_size, self.index_topk), dtype=torch.int32, device=device)
++        return out
++
++    # ---- per step --------------------------------------------------------
++    def _static(self, name: str):
++        # The forward context is keyed the same way as static_forward_context;
++        # the replicas / source layers registered themselves there at init.
++        return self._static_ctx[name]
++
++    def bind_static_context(self, static_forward_context: dict) -> None:
++        self._static_ctx = static_forward_context
++
++    def receive(
++        self,
++        tensors: dict[str, torch.Tensor],
++        positions: torch.Tensor,
++        topk_indices_buffer: torch.Tensor | None,
++        candidate_block_buffer: torch.Tensor | None,
++    ) -> None:
++        """Scatter the shipped rows into this rank's replicas/buffers."""
++        num_tokens = positions.shape[0]
++        attn_metadata = get_forward_context().attn_metadata
++        if self.recv_plan.cand and candidate_block_buffer is not None:
++            candidate_block_buffer[:num_tokens].copy_(tensors["pp_cand"][:num_tokens])
++        if self.recv_plan.topk and topk_indices_buffer is not None:
++            topk_indices_buffer[:num_tokens].copy_(tensors["pp_topk"][:num_tokens])
++        if not isinstance(attn_metadata, dict):
++            return  # profile / dummy run: caches unbound, nothing to place
++        for s in self.recv_plan.kv_sources:
++            name = f"{self._layers_prefix}.{s}.attn"
++            md = attn_metadata.get(name)
++            if md is None:
++                continue
++            _copy_rows(_kv_rows_kernel, self._static(name).kv_cache, md.slot_mapping,
++                       positions, tensors[f"pp_kv{s}"], self.ratio[s], gather=False)
++        for s in self.recv_plan.ik_sources:
++            name = f"{self._layers_prefix}.{s}.attn.indexer.k_cache"
++            md = attn_metadata.get(name)
++            if md is None:
++                continue
++            _copy_rows(_ik_rows_kernel, self._static(name).kv_cache, md.slot_mapping,
++                       positions, tensors[f"pp_ik{s}"], self.ratio[s], gather=False)
++
++    def send(
++        self,
++        positions: torch.Tensor,
++        topk_indices_buffer: torch.Tensor | None,
++        candidate_block_buffer: torch.Tensor | None,
++    ) -> dict[str, torch.Tensor]:
++        """Gather this step's rows from local caches (source or replica)."""
++        num_tokens = positions.shape[0]
++        out: dict[str, torch.Tensor] = {}
++        attn_metadata = get_forward_context().attn_metadata
++        have_md = isinstance(attn_metadata, dict)
++        for s in self.send_plan.kv_sources:
++            name = f"{self._layers_prefix}.{s}.attn"
++            rows = self._buffers[f"pp_kv{s}"][:num_tokens]
++            md = attn_metadata.get(name) if have_md else None
++            if md is not None:
++                _copy_rows(_kv_rows_kernel, self._static(name).kv_cache, md.slot_mapping,
++                           positions, rows, self.ratio[s], gather=True)
++            out[f"pp_kv{s}"] = rows
++        for s in self.send_plan.ik_sources:
++            name = f"{self._layers_prefix}.{s}.attn.indexer.k_cache"
++            rows = self._buffers[f"pp_ik{s}"][:num_tokens]
++            md = attn_metadata.get(name) if have_md else None
++            if md is not None:
++                _copy_rows(_ik_rows_kernel, self._static(name).kv_cache, md.slot_mapping,
++                           positions, rows, self.ratio[s], gather=True)
++            out[f"pp_ik{s}"] = rows
++        if self.send_plan.cand:
++            assert candidate_block_buffer is not None
++            out["pp_cand"] = candidate_block_buffer[:num_tokens]
++        if self.send_plan.topk:
++            assert topk_indices_buffer is not None
++            out["pp_topk"] = topk_indices_buffer[:num_tokens]
++        return out
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index 1007cc94fe..997860ba71 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -643,16 +643,8 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
+ 
+ 
+ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
+-    max_model_len = vllm_config.model_config.max_model_len
+-    # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
+-    # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
+-    # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.
+-    # The memory usage of the workspace there is 576 * 2 bytes; so we size this as
+-    # (576 * 2 // 132) * 5 = 40 to maximize this workspace size while still fitting
+-    # within the flashmla_sparse workspace.
+-    # For DeepSeek-V3.2, the max_model_len is 163840.
+-    #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+-    return max_model_len * 40
++    from vllm.v1.attention.backends.mla.streamed_workspace import gather_capacity
++    return gather_capacity(vllm_config)
+ 
+ 
+ def _supports_varlen_paged_mqa_logits() -> bool:
+@@ -1100,10 +1092,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+             # slice below).
+             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
+             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
++            from vllm.v1.attention.backends.mla.streamed_workspace import chunk_capacity, eligible
++            gather_budget = chunk_capacity(self.vllm_config, self.max_prefill_buffer_size, self.compress_ratio)
++            if eligible(self.vllm_config) and torch.any(compressed_seq_lens_cpu[num_decodes:] > gather_budget):
++                raise ValueError("A single indexer context exceeds its qualified gather allocation")
+             chunk_specs = split_indexer_prefill_chunks(
+                 compressed_seq_lens_cpu[num_decodes:],
+                 prefill_query_lens_cpu,
+-                self.max_prefill_buffer_size,
++                gather_budget,
+                 max_logits_bytes,
+                 request_offset=num_decodes,
+             )
+diff --git a/vllm/v1/attention/backends/mla/streamed_workspace.py b/vllm/v1/attention/backends/mla/streamed_workspace.py
+new file mode 100644
+index 0000000000..229e169994
+--- /dev/null
++++ b/vllm/v1/attention/backends/mla/streamed_workspace.py
+@@ -0,0 +1,32 @@
++"""Experimental one-window gather allocation with request-level chunking.
++
++Only capacity and request partitioning change. Never use a compressed coordinate
++budget larger than the actual compressed gather allocation.
++"""
++def eligible(config):
++    text=getattr(config.model_config,'hf_text_config',None)
++    parallel=config.parallel_config
++    return (text is not None and getattr(text,'model_type',None) in ('deepseek_v41','deepseek_v41_text')
++            and getattr(text,'hidden_size',None)==5120
++            and getattr(text,'num_hidden_layers',None)==40
++            and getattr(text,'n_routed_experts',None)==384
++            and getattr(text,'compress_ratios',None)
++            and all(r in (0,1,2) for r in text.compress_ratios)
++            and config.cache_config.block_size==128
++            and parallel.decode_context_parallel_size==1
++            and parallel.prefill_context_parallel_size==1)
++
++
++def gather_capacity(config):
++    length=int(config.model_config.max_model_len)
++    if not eligible(config):return length*40
++    drafts=int(config.num_speculative_tokens)
++    if drafts<0:raise ValueError('Negative draft count')
++    grain=128*max(1,max(config.model_config.hf_text_config.compress_ratios))
++    return ((length+drafts+1+grain-1)//grain)*grain
++
++
++def chunk_capacity(config,uncompressed_capacity,ratio):
++    if not eligible(config):return uncompressed_capacity
++    if ratio not in (1,2):raise ValueError('Unqualified indexer compression ratio')
++    return uncompressed_capacity//ratio
+diff --git a/vllm/v1/attention/backends/utils.py b/vllm/v1/attention/backends/utils.py
+index c9596e1c9c..248040b2ef 100644
+--- a/vllm/v1/attention/backends/utils.py
++++ b/vllm/v1/attention/backends/utils.py
+@@ -263,10 +263,19 @@ def resolve_kv_cache_layout(
+     assert supported_layouts and all(supported_layouts), (
+         "No worker reported supported KV cache layouts."
+     )
+-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
+-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
++    # Pipeline ranks can host different subsets of a model's cache types
++    # (e.g. DeepSeek V4.1 ranks without an indexer cache support more
++    # layouts than ranks with one), so take the layouts every worker
++    # supports, in the first worker's preference order.
++    common = [
++        name
++        for name in supported_layouts[0]
++        if all(name in names for names in supported_layouts[1:])
++    ]
++    assert common, (
++        f"Workers share no supported KV cache layout: {supported_layouts}."
+     )
+-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
++    candidates = [_layout_from_name(name) for name in common]
+ 
+     # A block-compact layout means the block is densely packed in memory, so any mix of
+     # specs can re-interpret HNC with different sizes as long as the total number of
+diff --git a/vllm/v1/attention/ops/mqa_logits_candidates_triton.py b/vllm/v1/attention/ops/mqa_logits_candidates_triton.py
+new file mode 100644
+index 0000000000..3ac2e11dfa
+--- /dev/null
++++ b/vllm/v1/attention/ops/mqa_logits_candidates_triton.py
+@@ -0,0 +1,516 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Candidate-only indexer logits for DeepSeek-V4.1's two-level selection.
++
++V4.1 index layers after the candidate source (24/28/32/36 in V4.1-Flash)
++only ever keep scores inside the ``candidate_topk_blocks`` blocks that layer
++20 published; ``apply_candidate_mask`` sets every other column to ``-inf``
++before the row top-k. On the sm_80 Triton path that meant scoring the whole
++context (``[rows, max_seq_len]``) and then discarding all but
++``topk_blocks * block_size`` columns per row.
++
++These kernels score only the candidate positions, producing a compact
++``[rows, topk_blocks * block_size]`` logits matrix, and map the row top-k back
++to request-local positions. The selected set is identical to
++``full logits -> apply_candidate_mask -> top-k`` (the masked columns could
++never win), so this is a pure work reduction: 8x fewer scored columns at
++128k context, 64x at 1M, on half of the index layers.
++
++Both the prefill (gathered contiguous K) and the paged decode cache layouts
++are handled by one kernel. Q is pre-decoded to bf16 once per row (it is tiny);
++K bytes are decoded in-kernel through the same bf16 LUT the paged decode
++kernel uses. The row top-k runs vLLM's CUDA ``top_k_per_row_decode`` on the
++compact matrix and a small Triton kernel maps the columns back to positions.
++"""
++
++import os
++
++import torch
++
++import vllm._custom_ops as ops
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.mqa_logits_triton import (
++    _decode_e4m3fn_bf16_lut,
++    _get_e4m3fn_bf16_lut,
++)
++
++# Candidate blocks scored per CTA; the tile is TILE * block_size positions
++# (128 at V4.1's block_size=8, matching the prefill kernel's BLOCK_N).
++_TILE = 16
++_NUM_WARPS = 4
++_NUM_STAGES = 2
++
++_PAD_SENTINEL = torch.iinfo(torch.int32).max
++_PREFILL_ROW_STEP = 1024
++# Unpaged (prefill) launches address K as one block of this size.
++_UNPAGED_KV_BLOCK = 1 << 30
++_ZERO_BT: dict[torch.device, torch.Tensor] = {}
++
++
++def _zero_block_table(device: torch.device) -> torch.Tensor:
++    t = _ZERO_BT.get(device)
++    if t is None:
++        t = torch.zeros((1, 1), dtype=torch.int32, device=device)
++        _ZERO_BT[device] = t
++    return t
++
++
++def candidate_logits_enabled() -> bool:
++    """Env kill switch for A/B validation (VLLM_DSV41_CAND_LOGITS=0)."""
++    return os.environ.get("VLLM_DSV41_CAND_LOGITS", "1") != "0"
++
++
++def use_candidate_logits(
++    candidate_blocks: torch.Tensor | None,
++    candidate_write: bool,
++    candidate_block_size: int,
++    width: int,
++) -> bool:
++    """Whether the compact candidate path replaces full scoring + mask.
++
++    Only consumers of the candidate set qualify (the source layer must score
++    everything to pick the candidates). Below ``topk_blocks * block_size``
++    columns every block is a candidate and the mask is a no-op, so the full
++    kernel is the cheaper one there.
++    """
++    if candidate_blocks is None or candidate_write:
++        return False
++    if not candidate_logits_enabled():
++        return False
++    return width > candidate_blocks.shape[1] * candidate_block_size
++
++
++@triton.jit
++def _candidate_logits_kernel(
++    q_ptr,
++    k_ptr,
++    k_scale_ptr,
++    weights_ptr,
++    fp8_lut_ptr,
++    cand_ptr,
++    start_ptr,
++    end_ptr,
++    block_tables_ptr,
++    logits_ptr,
++    stride_q_m,
++    stride_q_h,
++    stride_q_d,
++    stride_k_blk,
++    stride_k_n,
++    stride_k_d,
++    stride_ks_blk,
++    stride_ks_n,
++    stride_w_m,
++    stride_w_h,
++    stride_c_m,
++    stride_c_k,
++    stride_bt_b,
++    stride_bt_k,
++    stride_l_m,
++    stride_l_n,
++    num_cand,
++    num_heads: tl.constexpr,
++    head_dim: tl.constexpr,
++    CAND_BLOCK: tl.constexpr,
++    KV_BLOCK: tl.constexpr,
++    NEXT_N: tl.constexpr,
++    HAS_START: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    TILE: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    m = tl.program_id(0).to(tl.int64)
++    t = tl.program_id(1)
++
++    # Column n of this tile is offset n % CAND_BLOCK inside candidate slot
++    # t*TILE + n // CAND_BLOCK of row m.
++    offs_n = tl.arange(0, BLOCK_N)
++    slot = t * TILE + offs_n // CAND_BLOCK
++    within = offs_n % CAND_BLOCK
++    cand = tl.load(
++        cand_ptr + m * stride_c_m + slot * stride_c_k,
++        mask=slot < num_cand,
++        other=-1,
++    ).to(tl.int64)
++    start = tl.load(start_ptr + m) if HAS_START else 0
++    end = tl.load(end_ptr + m)
++    pos = start + cand * CAND_BLOCK + within
++    # Same bounds as apply_candidate_mask: a real candidate slot and inside
++    # the row's causal range [start, end). Padded slots carry -1.
++    valid = (cand >= 0) & (pos < end)
++    pos = tl.where(valid, pos, 0)
++
++    offs_h = tl.arange(0, BLOCK_H)
++    offs_d = tl.arange(0, BLOCK_D)
++    mask_h = offs_h < num_heads
++    mask_d = offs_d < head_dim
++
++    q = tl.load(
++        q_ptr + m * stride_q_m + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d,
++        mask=mask_h[:, None] & mask_d[None, :],
++        other=0.0,
++    )
++
++    # One code path for both layouts: the prefill wrapper passes a single
++    # "block" (KV_BLOCK larger than any N, a one-entry zero block table with
++    # zero strides), so blk == 0 and in_blk == pos. A constexpr if here
++    # trips Triton 3.7's RemoveLayoutConversions pass on sm_80.
++    blk = tl.load(
++        block_tables_ptr + (m // NEXT_N) * stride_bt_b + (pos // KV_BLOCK) * stride_bt_k,
++        mask=valid,
++        other=0,
++    ).to(tl.int64)
++    in_blk = pos % KV_BLOCK
++    k_row = blk * stride_k_blk + in_blk * stride_k_n
++    s_row = blk * stride_ks_blk + in_blk * stride_ks_n
++
++    k_byte = tl.load(
++        k_ptr + k_row[:, None] + offs_d[None, :] * stride_k_d,
++        mask=valid[:, None] & mask_d[None, :],
++        other=0,
++    )
++    k_scale = tl.load(k_scale_ptr + s_row, mask=valid, other=0.0)
++    k = _decode_e4m3fn_bf16_lut(k_byte, fp8_lut_ptr)
++    s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
++
++    w = tl.load(
++        weights_ptr + m * stride_w_m + offs_h * stride_w_h,
++        mask=mask_h,
++        other=0.0,
++    )
++    s = tl.where(s > 0, s, 0.0) * w[:, None]
++    out = tl.sum(s, axis=0)
++    out = tl.where(valid, out, float("-inf"))
++
++    col = t * BLOCK_N + offs_n
++    tl.store(
++        logits_ptr + m * stride_l_m + col * stride_l_n,
++        out,
++        mask=col < num_cand * CAND_BLOCK,
++    )
++
++
++def _launch(
++    q_bf16: torch.Tensor,
++    k_byte: torch.Tensor,
++    k_scale: torch.Tensor,
++    weights: torch.Tensor,
++    cand: torch.Tensor,
++    start: torch.Tensor | None,
++    end: torch.Tensor,
++    block_tables: torch.Tensor | None,
++    next_n: int,
++    block_size: int,
++    kv_block_size: int,
++    paged: bool,
++) -> torch.Tensor:
++    rows, num_heads, head_dim = q_bf16.shape
++    num_cand = cand.shape[1]
++    width = num_cand * block_size
++    logits = torch.empty((rows, width), dtype=torch.float32, device=q_bf16.device)
++    if rows == 0:
++        return logits
++    fp8_lut = _get_e4m3fn_bf16_lut(q_bf16.device)
++    if paged:
++        k_strides = (k_byte.stride(0), k_byte.stride(1), k_byte.stride(2))
++        s_strides = (k_scale.stride(0), k_scale.stride(1))
++        bt_strides = (block_tables.stride(0), block_tables.stride(1))
++    else:
++        k_strides = (0, k_byte.stride(0), k_byte.stride(1))
++        s_strides = (0, k_scale.stride(0))
++        bt_strides = (0, 0)
++        block_tables = _zero_block_table(q_bf16.device)
++        kv_block_size = _UNPAGED_KV_BLOCK
++    block_n = _TILE * block_size
++    grid = (rows, triton.cdiv(num_cand, _TILE))
++    _candidate_logits_kernel[grid](
++        q_bf16,
++        k_byte,
++        k_scale,
++        weights,
++        fp8_lut,
++        cand,
++        end if start is None else start,
++        end,
++        block_tables,
++        logits,
++        q_bf16.stride(0),
++        q_bf16.stride(1),
++        q_bf16.stride(2),
++        *k_strides,
++        *s_strides,
++        weights.stride(0),
++        weights.stride(1),
++        cand.stride(0),
++        cand.stride(1),
++        *bt_strides,
++        logits.stride(0),
++        logits.stride(1),
++        num_cand,
++        num_heads=num_heads,
++        head_dim=head_dim,
++        CAND_BLOCK=block_size,
++        KV_BLOCK=kv_block_size,
++        NEXT_N=next_n,
++        HAS_START=start is not None,
++        BLOCK_H=max(16, triton.next_power_of_2(num_heads)),
++        BLOCK_D=triton.next_power_of_2(head_dim),
++        TILE=_TILE,
++        BLOCK_N=block_n,
++        num_warps=_NUM_WARPS,
++        num_stages=_NUM_STAGES,
++    )
++    return logits
++
++
++@triton.jit
++def _map_topk_kernel(
++    idx_ptr,
++    logits_ptr,
++    cand_ptr,
++    out_ptr,
++    stride_i_m,
++    stride_i_k,
++    stride_l_m,
++    stride_l_n,
++    stride_c_m,
++    stride_c_k,
++    stride_o_m,
++    stride_o_k,
++    pad_value,
++    CAND_BLOCK: tl.constexpr,
++    TOPK: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    m = tl.program_id(0).to(tl.int64)
++    offs = tl.arange(0, BLOCK_K)
++    mask = offs < TOPK
++    col = tl.load(idx_ptr + m * stride_i_m + offs * stride_i_k, mask=mask, other=-1)
++    ok = col >= 0
++    col = tl.where(ok, col, 0)
++    # top_k_per_row_decode fills a row that has fewer finite columns than
++    # TOPK with -inf picks (it never emits -1). Those map to candidate
++    # positions past the row's causal bound, so drop them here: a selected
++    # column is only valid if its score is finite.
++    score = tl.load(
++        logits_ptr + m * stride_l_m + col * stride_l_n,
++        mask=mask & ok,
++        other=float("-inf"),
++    )
++    ok = ok & (score > float("-inf"))
++    block = tl.load(
++        cand_ptr + m * stride_c_m + (col // CAND_BLOCK) * stride_c_k,
++        mask=mask & ok,
++        other=-1,
++    )
++    ok = ok & (block >= 0)
++    rel = block * CAND_BLOCK + col % CAND_BLOCK
++    tl.store(
++        out_ptr + m * stride_o_m + offs * stride_o_k,
++        tl.where(ok, rel, pad_value),
++        mask=mask,
++    )
++
++
++def _topk_from_candidate_logits(
++    logits: torch.Tensor,
++    cand: torch.Tensor,
++    block_size: int,
++    topk_indices: torch.Tensor,
++    topk_tokens: int,
++    sort: bool,
++) -> None:
++    """Row top-k over the compact logits, emitted as request-local positions.
++
++    ``top_k_per_row_decode`` (the kernel the full decode path already trusts
++    on sm_80) selects the columns; the map kernel turns compact column
++    ``c`` into position ``cand[row, c // block] * block + c % block``. With
++    ``sort`` the row is emitted in ascending position order with the ``-1``
++    pads at the tail, matching ``_top_k_per_row_prefill_torch``; decode keeps
++    the selection kernel's own order like the full path does.
++    """
++    rows, width = logits.shape
++    assert topk_tokens <= width
++    cols = torch.empty((rows, topk_tokens), dtype=torch.int32, device=logits.device)
++    row_width = torch.full((rows,), width, dtype=torch.int32, device=logits.device)
++    ops.top_k_per_row_decode(
++        logits,
++        1,
++        row_width,
++        cols,
++        rows,
++        logits.stride(0),
++        logits.stride(1),
++        topk_tokens,
++    )
++    out = cols if sort else topk_indices
++    _map_topk_kernel[(rows,)](
++        cols,
++        logits,
++        cand,
++        out,
++        cols.stride(0),
++        cols.stride(1),
++        logits.stride(0),
++        logits.stride(1),
++        cand.stride(0),
++        cand.stride(1),
++        out.stride(0),
++        out.stride(1),
++        _PAD_SENTINEL if sort else -1,
++        CAND_BLOCK=block_size,
++        TOPK=topk_tokens,
++        BLOCK_K=triton.next_power_of_2(topk_tokens),
++    )
++    if sort:
++        out, _ = out.sort(dim=-1)
++        topk_indices[:] = torch.where(out == _PAD_SENTINEL, out.new_full((), -1), out)
++
++
++def candidate_topk_prefill(
++    q: torch.Tensor,
++    kv: tuple[torch.Tensor, torch.Tensor],
++    weights: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++    candidate_blocks: torch.Tensor,
++    block_size: int,
++    topk_indices: torch.Tensor,
++    topk_tokens: int,
++) -> None:
++    """Prefill: score candidates against the gathered K and write the top-k.
++
++    Args:
++        q:             [M, H, D] fp8_e4m3fn
++        kv:            (k_fp8 [N, D], k_scales [N]) as in fp8_mqa_logits_triton
++        weights:       [M, H] float32
++        cu_seqlen_ks/ke: [M] int32 packed-column bounds per row
++        candidate_blocks: [M, K] int32 request-local block ids, -1 padded
++        topk_indices:  [M, topk_tokens] int32 output (relative to ks)
++    """
++    k_fp8, k_scales = kv
++    q_bf16 = q.to(torch.bfloat16)
++    k_byte = k_fp8.view(torch.uint8)
++    k_scales = k_scales.reshape(-1)
++    # Row-chunk so the compact transient stays at
++    # _PREFILL_ROW_STEP * topk_blocks * block_size * 4 B (64 MiB at V4.1).
++    for r0 in range(0, q.shape[0], _PREFILL_ROW_STEP):
++        r1 = min(r0 + _PREFILL_ROW_STEP, q.shape[0])
++        logits = _launch(
++            q_bf16[r0:r1],
++            k_byte,
++            k_scales,
++            weights[r0:r1],
++            candidate_blocks[r0:r1],
++            cu_seqlen_ks[r0:r1],
++            cu_seqlen_ke[r0:r1],
++            None,
++            1,
++            block_size,
++            1,
++            False,
++        )
++        _topk_from_candidate_logits(
++            logits,
++            candidate_blocks[r0:r1],
++            block_size,
++            topk_indices[r0:r1],
++            topk_tokens,
++            sort=True,
++        )
++        del logits
++
++
++def candidate_topk_decode(
++    q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    weights: torch.Tensor,
++    seq_lens: torch.Tensor,
++    block_tables: torch.Tensor,
++    candidate_blocks: torch.Tensor,
++    block_size: int,
++    topk_indices: torch.Tensor,
++    topk_tokens: int,
++) -> None:
++    """Decode: score candidates straight out of the paged indexer cache.
++
++    Args:
++        q:          [B, next_n, H, D] fp8_e4m3fn
++        kv_cache:   [num_blocks, kv_block_size, 1, D+4] uint8 (FP8 + fp32 scale)
++        weights:    [B*next_n, H] float32
++        seq_lens:   per-token effective context lengths: (B,) / (B, 1) when
++                    every row of a request shares one bound, or (B, next_n)
++                    with [b, j] = L_b - next_n + j + 1 (native spec decode)
++        block_tables: [B, max_blocks] int32
++        candidate_blocks: [B*next_n, K] int32, -1 padded
++        topk_indices: [B*next_n, topk_tokens] int32 output
++    """
++    B, next_n, num_heads, head_dim = q.shape
++    rows = B * next_n
++    num_blocks, kv_block_size, one, d_plus_4 = kv_cache.shape
++    assert one == 1 and d_plus_4 == head_dim + 4
++    kv_flat = kv_cache.view(num_blocks, -1)
++    k_end = kv_block_size * head_dim
++    kv_byte = kv_flat[:, :k_end].as_strided(
++        (num_blocks, kv_block_size, head_dim),
++        (kv_flat.stride(0), head_dim, 1),
++    )
++    kv_scale = kv_flat[:, k_end:].view(torch.float32)
++
++    vis = seq_lens.reshape(-1)
++    if vis.numel() == rows:
++        row_end = vis
++    else:
++        # One bound per request: row j of request b sees L_b - next_n + j + 1
++        # positions (the paged kernel's `k_offset <= q_offset`).
++        offs = torch.arange(next_n, device=vis.device, dtype=vis.dtype)
++        row_end = (vis[:B, None] - next_n + 1 + offs[None, :]).clamp_(min=0)
++        row_end = row_end.reshape(-1)
++    row_end = row_end.to(torch.int32)
++
++    logits = _launch(
++        q.to(torch.bfloat16).reshape(rows, num_heads, head_dim),
++        kv_byte,
++        kv_scale,
++        weights,
++        candidate_blocks,
++        None,
++        row_end,
++        block_tables,
++        next_n,
++        block_size,
++        kv_block_size,
++        True,
++    )
++    _topk_from_candidate_logits(
++        logits, candidate_blocks, block_size, topk_indices, topk_tokens, sort=False
++    )
++
++
++def warmup_candidate_logits_triton(
++    num_heads: int,
++    head_dim: int,
++    block_size: int,
++    kv_block_sizes: list[int],
++    device: torch.device,
++) -> None:
++    """Compile both specializations before any cudagraph capture."""
++    rows, num_cand = 2, 64
++    q = torch.zeros((rows, num_heads, head_dim), dtype=torch.bfloat16, device=device)
++    w = torch.zeros((rows, num_heads), dtype=torch.float32, device=device)
++    cand = torch.arange(num_cand, dtype=torch.int32, device=device)
++    cand = cand[None, :].repeat(rows, 1)
++    n = num_cand * block_size
++    k = torch.zeros((n, head_dim), dtype=torch.uint8, device=device)
++    ks = torch.zeros(rows, dtype=torch.int32, device=device)
++    ke = torch.full((rows,), n, dtype=torch.int32, device=device)
++    _launch(q, k, ks.new_zeros(n, dtype=torch.float32), w, cand, ks, ke,
++            None, 1, block_size, 1, False)
++    for kv_bs in kv_block_sizes:
++        nb = triton.cdiv(n, kv_bs)
++        kv_byte = torch.zeros((nb, kv_bs, head_dim), dtype=torch.uint8, device=device)
++        kv_scale = torch.zeros((nb, kv_bs), dtype=torch.float32, device=device)
++        bt = torch.arange(nb, dtype=torch.int32, device=device)[None, :].repeat(rows, 1)
++        _launch(q, kv_byte, kv_scale, w, cand, None, ke, bt, 1, block_size,
++                kv_bs, True)
 diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
-index 7085040..0068d26 100644
+index 708504050d..0068d260e0 100644
 --- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
 +++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
 @@ -1571,14 +1571,14 @@ def _sparse_attn_prefill_ragged_kernel(
@@ -1527,3 +3493,797 @@ index 7085040..0068d26 100644
      attn_out = _rocm_sparse_attn_decode_triton(
          q=q,
          main_cache=swa_k_cache,
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 076e4932d8..7955cc343e 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1725,8 +1725,15 @@ def get_kv_cache_config_from_groups(
+         group_spec = group.kv_cache_spec
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
+-            for layer_name, spec in group_spec.kv_cache_specs.items():
+-                layers_by_spec[spec].append(layer_name)
++            # Only this worker's layers: a pipeline rank that owns no layer
++            # of the group still carries the global UniformTypeKVCacheSpecs
++            # (projection leaves it untouched when the layer list is empty),
++            # and emitting tensors for foreign layers makes allocate_kv_cache
++            # fail to find them in any group.
++            for layer_name in group.layer_names:
++                layers_by_spec[group_spec.kv_cache_specs[layer_name]].append(
++                    layer_name
++                )
+         elif group.layer_names:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index 56a532b809..99f099015b 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -28,8 +28,24 @@ class AsyncScheduler(Scheduler):
+             if request.is_prefill_chunk:
+                 continue
+ 
++            # The grammar bitmask must be computed against the real draft tokens,
++            # which the worker only supplies once the batch has executed (the
++            # engine's deferred path). `num_output_placeholders > 0` is not a
++            # sufficient test for "the scheduled spec tokens are placeholders":
++            # under the PP batch queue a request is never rescheduled while in
++            # flight, so its previous output has already been processed and the
++            # counter is 0, yet the spec tokens scheduled for this step are still
++            # the -1 placeholders. Computing the bitmask against them masks only
++            # the first position (the builder treats -1 as an invalid draft and
++            # stops masking), the worker verifies the real drafts unmasked, and
++            # the grammar later rejects the accepted tokens and kills the request.
++            scheduled_spec = spec_decode_tokens.get(req_id, ())
+             scheduler_output.pending_structured_output_tokens |= (
+-                request.use_structured_output and request.num_output_placeholders > 0
++                request.use_structured_output
++                and (
++                    request.num_output_placeholders > 0
++                    or any(token < 0 for token in scheduled_spec)
++                )
+             )
+             # The request will generate num_sampled_tokens_per_step new tokens
+             # plus num_spec_tokens in this scheduling step. Diffusion has no AR
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index c9d969cd34..478ad9c3d2 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -316,3 +316,8 @@ class GrammarOutput:
+     structured_output_request_ids: list[str]
+     # Bitmask ordered as structured_output_request_ids.
+     grammar_bitmask: "npt.NDArray[np.int32]"
++    # Per request, ordered as structured_output_request_ids: how many leading
++    # drafts the bitmask constrained. `grammar_bitmask` fills every row after
++    # the first -1 placeholder with the all-permissive `_full_mask`, so drafts
++    # from this index on must not be accepted. None means nothing to invalidate.
++    num_acceptable_drafts: list[int] | None = None
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index dbc697a798..b9b2151d61 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -66,11 +67,35 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
++from vllm.v1.structured_output.utils import strip_speculative_padding
+ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+ 
+ 
++def _spread_decode_slots() -> int:
++    """``VLLM_DSV41_SPREAD_DECODE=N``: admit at most N decode requests per
++    scheduler step and re-arm each of them one ring period later.
++
++    With pipeline parallelism the engine runs ``max_concurrent_batches`` steps
++    in flight (== ``pipeline_parallel_size``), so the pipeline is only full when
++    those slots hold independent batches. The stock scheduler fills every slot
++    with *every* runnable request instead, so a burst of C requests rides as C
++    fat steps rather than C thin ones: each stage pays the full batch cost and
++    the ring buys nothing. Measured on 8x CMP 170HX, PP=8: a burst admitted in
++    one step ran at 274 tok/s aggregate and 34 tok/s per stream, the same
++    requests spread over the ring at 531 and 66. Unset or 0 keeps stock."""
++
++    raw = os.environ.get("VLLM_DSV41_SPREAD_DECODE") or "0"
++    try:
++        return max(0, int(raw))
++    except ValueError:
++        logger.warning_once(
++            "VLLM_DSV41_SPREAD_DECODE=%r is not an integer; ignoring it", raw
++        )
++        return 0
++
++
+ class Scheduler(SchedulerInterface):
+     def __init__(
+         self,
+@@ -243,6 +268,32 @@ class Scheduler(SchedulerInterface):
+             mm_budget.encoder_compute_budget if mm_budget else 0
+         )
+         encoder_cache_size = mm_budget.encoder_cache_size if mm_budget else 0
++        # Decouple the encoder cache (scheduler-side accounting of the encoder
++        # outputs the stage-0 model runner keeps on GPU) is decoupled from
++        # max_num_batched_tokens. Stock vLLM sizes it to one prefill chunk, so
++        # two adjacent images whose embeddings together exceed the chunk could
++        # never be co-resident (see _try_schedule_encoder_inputs). The compute
++        # budget per step stays stock (it bounds the ViT activations that the
++        # memory profile measured); only residency grows.
++        self.dsv41_encoder_stall_seconds = float(
++            os.environ.get("VLLM_DSV41_ENCODER_STALL_SECONDS", "30")
++        )
++        self.dsv41_encoder_stall_steps = int(
++            os.environ.get("VLLM_DSV41_ENCODER_STALL_STEPS", "64")
++        )
++        self._dsv41_enc_blocked_now: set[str] = set()
++        self._dsv41_enc_stall: dict[str, list[float]] = {}
++        if mm_budget:
++            override = int(os.environ.get("VLLM_DSV41_ENCODER_CACHE_TOKENS", "0") or 0)
++            if override > encoder_cache_size:
++                logger.info(
++                    "Encoder cache residency %d -> %d embeddings "
++                    "(compute budget per step stays %d)",
++                    encoder_cache_size,
++                    override,
++                    self.max_num_encoder_input_tokens,
++                )
++                encoder_cache_size = override
+         manager_cls_obj = vllm_config.ec_manager_config.get_encoder_cache_manager_obj()
+         if manager_cls_obj is None:
+             manager_cls_obj = (
+@@ -318,6 +369,11 @@ class Scheduler(SchedulerInterface):
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+         self.current_step = 0
++        # V4.1/sm_80 climbing aid (VLLM_DSV41_SPREAD_DECODE): decodes admitted in
++        # the current step, and the ring period used to re-arm them.
++        self.spread_decode_slots = _spread_decode_slots()
++        self._spread_admitted = 0
++        self._spread_period = 1
+         # DP prefill balancing: Flag to track whether the last cadence-aligned
+         # prefill batch fully drained the waiting queue. Prefill throttling
+         # is disabled in this case.
+@@ -506,8 +562,46 @@ class Scheduler(SchedulerInterface):
+             num_new_tokens -= self.num_prefill_lookahead - remaining
+         return max(num_new_tokens, 0)
+ 
++    def _spread_candidates(self) -> int:
++        """Running requests currently decoding (prompt already computed)."""
++        return sum(1 for request in self.running if self._is_spread_decode(request))
++
++    def _is_spread_decode(self, request: Request) -> bool:
++        """True for a step that is a decode, i.e. not prompt processing.
++
++        A prefill chunk is exempt: delaying it costs TTFT and buys no
++        pipelining, since only decode steps need to occupy separate slots of
++        the PP ring. The finishing step of a fully prefix-cached prompt still
++        counts as prefill here (``num_computed_tokens < num_prompt_tokens``), so
++        a burst is spaced from its second step on; the first is one token each.
++        """
++        return (
++            not request.is_prefill_chunk
++            and request.num_computed_tokens >= request.num_prompt_tokens
++        )
++
++    def _prepare_spread_decode(self) -> None:
++        """Size this step's decode admission cap and the re-arm period.
++
++        Period = the ring slot count, so C requests share the ring as
++        ``ceil(C / slots)`` phases instead of fusing into one batch. Nothing is
++        touched while the decodes already fit in one step (C <= slots), which
++        keeps the single-stream and low-concurrency cases on the stock path.
++        A period shorter than ``pipeline_parallel_size`` is fine: the stock
++        scheduler re-admits every step (period 1), so the ring tolerates it.
++        """
++        self._spread_admitted = 0
++        if not self.spread_decode_slots:
++            return
++        candidates = self._spread_candidates()
++        if candidates <= self.spread_decode_slots:
++            self._spread_period = 1
++            return
++        self._spread_period = -(-candidates // self.spread_decode_slots)
++
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
++        self._prepare_spread_decode()
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+         # Each request just has the num_computed_tokens and
+@@ -537,6 +631,7 @@ class Scheduler(SchedulerInterface):
+         # Encoder-related.
+         scheduled_encoder_inputs: dict[str, list[int]] = {}
+         encoder_compute_budget = self.max_num_encoder_input_tokens
++        self._dsv41_enc_blocked_now = set()
+         # Spec decode-related.
+         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+         # Whether the running batch contains any prefill requests.
+@@ -584,6 +679,17 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            if (
++                self.spread_decode_slots
++                and self._spread_admitted >= self.spread_decode_slots
++                and self._is_spread_decode(request)
++            ):
++                # V4.1/sm_80: keep this step's batch thin. The requests skipped
++                # here are due (or become due next step) and take other slots of
++                # the PP ring, instead of fusing into this batch.
++                req_index += 1
++                continue
++
+             if defer_prefills and request.is_prefill_chunk:
+                 # DP prefill balancing: defer this in-progress prefill chunk to a
+                 # cadence-aligned step; decodes still run to fill this step.
+@@ -595,6 +701,16 @@ class Scheduler(SchedulerInterface):
+                 + request.num_output_placeholders
+                 - request.num_computed_tokens
+             )
++            # Hard per-step cap without the soft long-prefill threshold: an
++            # atomic image span may exceed the (mixed/fair) threshold.
++            mm_hard_cap = min(
++                num_new_tokens,
++                token_budget,
++                input_budget - draft_slots,
++                self.max_model_len
++                - request.num_computed_tokens
++                - self.num_sampled_tokens_per_step,
++            )
+             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+             num_new_tokens = min(
+@@ -632,6 +748,11 @@ class Scheduler(SchedulerInterface):
+                     num_new_tokens,
+                     encoder_compute_budget,
+                     shift_computed_tokens=self.num_prefill_lookahead,
++                    max_new_tokens=(
++                        mm_hard_cap
++                        if not self.need_mamba_block_aligned_split
++                        else None
++                    ),
+                 )
+ 
+             # Multi-module MTP: avoid ending a prefill chunk within
+@@ -734,6 +855,13 @@ class Scheduler(SchedulerInterface):
+             num_scheduled_tokens[request_id] = num_new_tokens
+             token_budget -= num_new_tokens
+             input_budget -= num_new_tokens + draft_slots
++            if self.spread_decode_slots and self._is_spread_decode(request):
++                # V4.1/sm_80: this decode keeps its ring slot for one period, so
++                # the next steps hand the remaining slots to other requests.
++                self._spread_admitted += 1
++                request.next_decode_eligible_step = (
++                    self.current_step + self._spread_period
++                )
+             req_index += 1
+ 
+             # Speculative decode related.
+@@ -1043,6 +1171,15 @@ class Scheduler(SchedulerInterface):
+                             num_new_tokens,
+                             encoder_compute_budget,
+                             shift_computed_tokens=self.num_prefill_lookahead,
++                            max_new_tokens=(
++                                min(
++                                    request.num_tokens - num_computed_tokens,
++                                    request_token_budget,
++                                )
++                                if not self.need_mamba_block_aligned_split
++                                and not pad_spec_decode
++                                else None
++                            ),
+                         )
+ 
+                     # Multi-module MTP: avoid ending a prefill chunk within
+@@ -1390,6 +1527,7 @@ class Scheduler(SchedulerInterface):
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
++        self._dsv41_encoder_watchdog(num_scheduled_tokens)
+         return scheduler_output
+ 
+     def _build_kv_connector_meta(
+@@ -1613,6 +1751,7 @@ class Scheduler(SchedulerInterface):
+         num_new_tokens: int,
+         encoder_compute_budget: int,
+         shift_computed_tokens: int = 0,
++        max_new_tokens: int | None = None,
+     ) -> tuple[list[int], int, int, list[int]]:
+         """
+         Determine which encoder inputs need to be scheduled in the current step,
+@@ -1631,6 +1770,22 @@ class Scheduler(SchedulerInterface):
+         limitations, the method adjusts `num_new_tokens` to schedule only the
+         decoder tokens up to just before the unschedulable encoder input.
+ 
++        Multimodal encoder cache liveness:
++        - ``max_new_tokens`` is the step's hard cap without the soft
++          long-prefill threshold. With atomic image spans
++          (disable_chunked_mm_input) a threshold smaller than the span (mixed-prefill / fair-share caps) used to roll the chunk back to
++          zero forever; the span may now exceed the threshold, never the
++          hard cap.
++        - When the encoder cache cannot admit an item, this request's own
++          entries that the decoder has already consumed are released first.
++          The deferred free in ``_free_encoder_inputs`` waits until
++          ``num_computed >= end + lookahead``, but the rollback here stops a
++          chunk at ``next_start - lookahead``; with one separator token
++          between two images (the chat template's "\\n") the previous image
++          could never be freed and the next could never be admitted when both
++          did not fit together: a silent deadlock.
++        - Zero-progress results are reported to the stall watchdog.
++
+         Note that num_computed_tokens includes both locally cached
+         blocks and externally cached blocks (via KVConnector).
+         """
+@@ -1641,6 +1796,8 @@ class Scheduler(SchedulerInterface):
+         assert mm_features is not None
+         assert len(mm_features) > 0
+         external_load_encoder_input = []
++        requested_new_tokens = num_new_tokens
++        reclaimed = False
+ 
+         # NOTE: since scheduler operates on the request level (possibly with
+         # multiple encoder inputs per request), we need to create temporary
+@@ -1708,13 +1865,47 @@ class Scheduler(SchedulerInterface):
+                 # Account for EAGLE shift when rolling back to avoid
+                 # encoder cache miss. This ensures the scheduled range
+                 # stops before start_pos even with the shift.
+-                num_new_tokens = max(
++                rolled_back = max(
+                     0, start_pos - (num_computed_tokens + shift_computed_tokens)
+                 )
+-                break
+-            if not self.encoder_cache_manager.can_allocate(
++                span_tokens = start_pos + num_encoder_tokens - num_computed_tokens
++                next_start = (
++                    mm_features[i + 1].mm_position.offset
++                    if i + 1 < len(mm_features)
++                    else None
++                )
++                if (
++                    rolled_back == 0
++                    and max_new_tokens is not None
++                    and span_tokens <= max_new_tokens
++                    and (
++                        next_start is None
++                        or next_start
++                        >= num_computed_tokens + span_tokens + shift_computed_tokens
++                    )
++                ):
++                    # The chunk sits right before the span and only the soft
++                    # threshold keeps it from covering the span: take the
++                    # whole span in this step (atomic, within the hard cap).
++                    num_new_tokens = span_tokens
++                    encoder_window_end = (
++                        num_computed_tokens + num_new_tokens + shift_computed_tokens
++                    )
++                else:
++                    num_new_tokens = rolled_back
++                    break
++            can_allocate = self.encoder_cache_manager.can_allocate(
+                 request, i, encoder_compute_budget, num_embeds_to_schedule
+-            ):
++            )
++            if not can_allocate and not reclaimed:
++                reclaimed = True
++                if self._reclaim_consumed_encoder_inputs(
++                    request, num_computed_tokens
++                ):
++                    can_allocate = self.encoder_cache_manager.can_allocate(
++                        request, i, encoder_compute_budget, num_embeds_to_schedule
++                    )
++            if not can_allocate:
+                 # The encoder cache is full or the encoder budget is exhausted.
+                 # NOTE(woosuk): We assume that the encoder input tokens should
+                 # be processed altogether, as the encoder usually uses
+@@ -1760,6 +1951,9 @@ class Scheduler(SchedulerInterface):
+             mm_hashes_to_schedule.add(item_identifier)
+             encoder_inputs_to_schedule.append(i)
+ 
++        if num_new_tokens == 0 and requested_new_tokens > 0:
++            self._dsv41_enc_blocked_now.add(request.request_id)
++
+         return (
+             encoder_inputs_to_schedule,
+             num_new_tokens,
+@@ -1767,6 +1961,79 @@ class Scheduler(SchedulerInterface):
+             external_load_encoder_input,
+         )
+ 
++    def _reclaim_consumed_encoder_inputs(
++        self, request: Request, num_computed_tokens: int
++    ) -> bool:
++        """Release this request's encoder entries the decoder has consumed.
++
++        An entry is consumed once every remaining step starts at or after its
++        end: the main model reads [c, ...), the eagle/DSpark drafter
++        [c + 1, ...), and the KV manager's re-prefillable window is
++        lookahead - 1 (0 for DSpark). Steps already in flight are not
++        affected: the worker applies frees in scheduling order, after them.
++        """
++        cached = self.encoder_cache_manager.get_cached_input_ids(request)
++        if not cached or self.is_encoder_decoder:
++            return False
++        margin = max(self.num_prefill_lookahead - 1, 0)
++        done = num_computed_tokens - request.num_output_placeholders
++        released = False
++        for input_id in list(cached):
++            position = request.mm_features[input_id].mm_position
++            if position.offset + position.length + margin <= done:
++                self.encoder_cache_manager.free_encoder_input(request, input_id)
++                released = True
++        return released
++
++    def _dsv41_encoder_watchdog(self, num_scheduled_tokens: dict[str, int]) -> None:
++        """Fail fast instead of hanging on a request whose prompt cannot advance.
++
++        A request reported by _try_schedule_encoder_inputs as blocked (zero
++        tokens although prompt tokens remain) for VLLM_DSV41_ENCODER_STALL_STEPS
++        consecutive scheduling passes and VLLM_DSV41_ENCODER_STALL_SECONDS is
++        finished with FINISHED_ERROR through the per-request error path, so
++        the client gets an error instead of an open stream.
++        """
++        blocked = self._dsv41_enc_blocked_now
++        stall = self._dsv41_enc_stall
++        for rid in list(stall):
++            if rid not in blocked or rid in num_scheduled_tokens:
++                del stall[rid]
++        if not blocked or self.dsv41_encoder_stall_seconds <= 0:
++            return
++        now = time.monotonic()
++        for rid in blocked:
++            if rid in num_scheduled_tokens:
++                continue
++            request = self.requests.get(rid)
++            if request is None or request.is_finished():
++                continue
++            entry = stall.setdefault(rid, [now, 0])
++            entry[1] += 1
++            if (
++                now - entry[0] < self.dsv41_encoder_stall_seconds
++                or entry[1] < self.dsv41_encoder_stall_steps
++            ):
++                continue
++            manager = self.encoder_cache_manager
++            logger.error(
++                "Encoder watchdog: request %s made no prompt progress for "
++                "%.1fs / %d scheduling passes (computed %d of %d prompt tokens, "
++                "%d multimodal items, encoder cache free %d + freeable %d of %d "
++                "embeddings); finishing it with an error instead of hanging",
++                rid,
++                now - entry[0],
++                int(entry[1]),
++                request.num_computed_tokens,
++                request.num_prompt_tokens,
++                len(request.mm_features or ()),
++                getattr(manager, "num_free_slots", -1),
++                getattr(manager, "num_freeable_slots", -1),
++                getattr(manager, "cache_size", -1),
++            )
++            self.grammar_compile_error_reqs.add(rid)
++            del stall[rid]
++
+     def _make_scheduled_encoder_input_stats(
+         self, scheduled_encoder_inputs: dict[str, list[int]]
+     ) -> ScheduledEncoderInputStats | None:
+@@ -1806,7 +2073,14 @@ class Scheduler(SchedulerInterface):
+             structured_output_request_ids,
+             scheduler_output.scheduled_spec_decode_tokens,
+         )
+-        return GrammarOutput(structured_output_request_ids, bitmask)
++        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
++        num_acceptable_drafts = [
++            len(strip_speculative_padding(spec_tokens.get(req_id, [])))
++            for req_id in structured_output_request_ids
++        ]
++        return GrammarOutput(
++            structured_output_request_ids, bitmask, num_acceptable_drafts
++        )
+ 
+     def update_from_output(
+         self,
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 4fb17bc79c..4b4d93a3e7 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -470,6 +470,13 @@ class SingleTypeKVCacheManager(ABC):
+         # retention: the replay boundary (``num_prompt - 1``, capped by
+         # ``get_computed_blocks``) and any detected shared-prefix junction.
+         reachable_boundaries = [request.num_prompt_tokens - 1]
++        if (
++            self.cache_hit_alignment_tokens
++            and request.num_prompt_tokens > self.cache_hit_alignment_tokens
++        ):
++            reachable_boundaries.append(
++                request.num_prompt_tokens - 1 - self.cache_hit_alignment_tokens
++            )
+         if request.shared_prefix_boundary:
+             reachable_boundaries.append(request.shared_prefix_boundary)
+ 
+diff --git a/vllm/v1/structured_output/utils.py b/vllm/v1/structured_output/utils.py
+index 0633c55fe6..78eef865b3 100644
+--- a/vllm/v1/structured_output/utils.py
++++ b/vllm/v1/structured_output/utils.py
+@@ -572,3 +572,17 @@ def choice_as_grammar(choice: list[str]) -> str:
+     escaped_choices = (escape_ebnf_string(c) for c in choice)
+     grammar = "root ::= " + " | ".join(f'"{c}"' for c in escaped_choices)
+     return grammar
++
++
++def strip_speculative_padding(token_ids: list[int]) -> list[int]:
++    """Drop speculative-decoding padding from a token block.
++
++    ngram and other speculative backends pad rejected draft positions with a
++    -1 sentinel. Structured-output grammars treat every entry as a real token
++    id, so the sentinels (and everything after the first one) are removed here,
++    before tokens reach any backend, rather than inside a single backend.
++    """
++    for i, token_id in enumerate(token_ids):
++        if token_id < 0:
++            return token_ids[:i]
++    return token_ids
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 7cb1bb2526..f4f8507acc 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -553,8 +553,14 @@ class ModelCudaGraphManager(CudaGraphManager):
+                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
+             }
+             if not self.is_first_pp_rank:
+-                # Update for non-first PP ranks.
+-                model_inputs["input_ids"] = None
++                # Update for non-first PP ranks. Models whose later layers
++                # read token ids (DeepSeek V4.1) keep them; mirrors
++                # GPUModelRunner._pp_requires_input_ids.
++                keep_ids = getattr(model_state.model, "pp_requires_input_ids", False) or (
++                    self.vllm_config.model_config.architecture or ""
++                ).startswith("DeepseekV41")
++                if not keep_ids:
++                    model_inputs["input_ids"] = None
+                 model_inputs["inputs_embeds"] = None
+                 assert intermediate_tensors is not None
+                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index ca69cccca7..9d0bacd892 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -171,6 +171,39 @@ from vllm.v1.worker.workspace import use_workspace_lane
+ logger = init_logger(__name__)
+ 
+ 
++def grammar_invalid_draft_positions(
++    input_batch: InputBatch,
++    grammar_req_ids: list[str],
++    num_acceptable_drafts: list[int] | None,
++    device: torch.device,
++) -> torch.Tensor | None:
++    """Indices of `draft_sampled` entries whose bitmask row is permissive.
++
++    Drafts from `num_acceptable_drafts` on were verified against rows carrying
++    `_full_mask`, so accepting one would sample with no grammar constraint.
++    Returns None when there is nothing to invalidate.
++    """
++    if not grammar_req_ids or input_batch.num_draft_tokens == 0:
++        return None
++    cu_num_logits = input_batch.cu_num_logits_np.tolist()
++    req_id_to_idx = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
++    positions: list[int] = []
++    for i, req_id in enumerate(grammar_req_ids):
++        req_idx = req_id_to_idx.get(req_id)
++        if req_idx is None:
++            continue
++        # Without the field (an older scheduler, or warmup) invalidate the whole
++        # window, which is the conservative choice.
++        num_acceptable = (
++            num_acceptable_drafts[i] if num_acceptable_drafts is not None else 0
++        )
++        start = cu_num_logits[req_idx] + 1 + num_acceptable
++        positions.extend(range(start, cu_num_logits[req_idx + 1]))
++    if not positions:
++        return None
++    return torch.tensor(positions, dtype=torch.int64, device=device)
++
++
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+@@ -504,6 +537,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+     def get_model(self) -> nn.Module:
+         return self.model
+ 
++    def _pp_requires_input_ids(self) -> bool:
++        """Whether non-first PP ranks must still receive token ids.
++
++        Declared by the model class (``pp_requires_input_ids``); the runner's
++        ``self.model`` may be a CUDA-graph or compile wrapper, so walk down the
++        usual wrapper attributes before giving up.
++        """
++        cached = getattr(self, "_pp_requires_input_ids_cache", None)
++        if cached is not None:
++            return cached
++        m = self.model
++        found = False
++        for _ in range(6):
++            if m is None:
++                break
++            if getattr(m, "pp_requires_input_ids", False):
++                found = True
++                break
++            m = next(
++                (
++                    getattr(m, attr)
++                    for attr in ("runnable", "_model", "model", "module", "_orig_mod")
++                    if getattr(m, attr, None) is not None
++                ),
++                None,
++            )
++        arch = getattr(self.model_config, "architecture", "") or ""
++        found = found or arch.startswith("DeepseekV41")
++        self._pp_requires_input_ids_cache = found
++        return found
++
+     def get_draft_model(self) -> nn.Module | None:
+         speculator = self.speculator
+         if not isinstance(speculator, DraftModelSpeculator):
+@@ -1456,6 +1520,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             sample_hidden_states = hidden_states[input_batch.logits_indices]
+             logits = self.model.compute_logits(sample_hidden_states)
+ 
++        invalid_draft_positions = None
+         if grammar_output is not None:
+             # Apply grammar bitmask to the logits in-place.
+             assert self.structured_outputs_worker is not None
+@@ -1465,6 +1530,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 grammar_output.structured_output_request_ids,
+                 grammar_output.grammar_bitmask,
+             )
++            invalid_draft_positions = grammar_invalid_draft_positions(
++                input_batch,
++                grammar_output.structured_output_request_ids,
++                grammar_output.num_acceptable_drafts,
++                self.device,
++            )
+ 
+         sampler_output: SamplerOutput | None
+         if input_batch.num_reqs == 0:
+@@ -1483,6 +1554,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch,
+                 # Draft logits are needed for probabilistic rejection sampling.
+                 self.speculator.draft_logits,
++                invalid_draft_positions,
+             )
+ 
+         if shard_metadata is not None:
+@@ -1747,8 +1819,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             **self.model_state.prepare_inputs(input_batch, self.req_states),
+         }
+         if not self.is_first_pp_rank:
+-            # Update for non-first PP ranks.
+-            model_inputs["input_ids"] = None
++            # Update for non-first PP ranks. Models whose later layers read
++            # token ids (DeepSeek V4.1: MoE routing masks image sentinels,
++            # the Engram n-gram hash on the rank owning layer 14) keep them;
++            # the buffer is prepared identically on every rank.
++            if not self._pp_requires_input_ids():
++                model_inputs["input_ids"] = None
+             model_inputs["inputs_embeds"] = None
+ 
+             # Prepare the intermediate tensors.
+diff --git a/vllm/v1/worker/gpu/sample/batch_shard.py b/vllm/v1/worker/gpu/sample/batch_shard.py
+index 0f484f1a17..07f798728b 100644
+--- a/vllm/v1/worker/gpu/sample/batch_shard.py
++++ b/vllm/v1/worker/gpu/sample/batch_shard.py
+@@ -335,9 +335,16 @@ def _shard_grammar_output(
+         cursor += num_req_logits
+     if not local_ids:
+         return None
++    # num_acceptable_drafts is ordered with structured_output_request_ids.
++    num_acceptable = grammar_output.num_acceptable_drafts
++    if num_acceptable is not None:
++        owned = set(local_ids)
++        ids = grammar_output.structured_output_request_ids
++        num_acceptable = [n for i, n in zip(ids, num_acceptable) if i in owned]
+     return GrammarOutput(
+         structured_output_request_ids=local_ids,
+         grammar_bitmask=grammar_output.grammar_bitmask[keep_indices],
++        num_acceptable_drafts=num_acceptable,
+     )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+index ba0b4d850a..9e89b5375c 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -65,9 +65,10 @@ def _load_embed_from_checkpoint(embed: nn.Module, model_path: str) -> None:
+     with torch.no_grad():
+         # VocabParallelEmbedding pads the vocab dimension, so copy into the
+         # leading rows rather than assigning the whole tensor.
+-        embed.weight.data[: w.shape[0]].copy_(
+-            w.to(dtype=embed.weight.dtype, device=embed.weight.device)
+-        )
++        # Use the layer's official loader: it selects this TP rank's rows
++        # and clears vocab padding. A full-matrix copy is only valid for TP1.
++        loader = getattr(embed.weight, "weight_loader", embed.weight_loader)
++        loader(embed.weight, w)
+     logger.info(
+         "DSpark+PP: loaded draft token embedding %s from key %r", tuple(w.shape), key
+     )
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index a9027e0550..63fb7e6371 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -152,6 +152,7 @@ class RejectionSampler:
+         idx_mapping_np: np.ndarray,
+         expanded_idx_mapping: torch.Tensor,
+         expanded_local_pos: torch.Tensor,
++        verify_draft_sampled: torch.Tensor,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+@@ -165,7 +166,7 @@ class RejectionSampler:
+         sampled, num_sampled = rejection_sample(
+             processed_logits,
+             draft_logits,
+-            draft_sampled,
++            verify_draft_sampled,
+             cu_num_logits,
+             pos,
+             idx_mapping,
+@@ -189,7 +190,10 @@ class RejectionSampler:
+         pos: torch.Tensor,
+         max_chunk_logits: int,
+         max_num_logprobs: int,
++        verify_draft_sampled: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
++        if verify_draft_sampled is None:
++            verify_draft_sampled = draft_sampled
+         cu_num_logits_np = input_batch.cu_num_logits_np
+         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         num_reqs = input_batch.num_reqs
+@@ -224,6 +228,7 @@ class RejectionSampler:
+                 input_batch.idx_mapping_np[start:end],
+                 input_batch.expanded_idx_mapping[lo:hi],
+                 input_batch.expanded_local_pos[lo:hi],
++                verify_draft_sampled[lo:hi],
+             )
+             chunk_logprobs = self._get_logprobs_tensors(
+                 sampled,
+@@ -262,6 +267,7 @@ class RejectionSampler:
+         logits: torch.Tensor,
+         input_batch: InputBatch,
+         draft_logits: torch.Tensor | None = None,
++        invalid_draft_positions: torch.Tensor | None = None,
+     ) -> SamplerOutput:
+         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
+         # that num_nans is computed before applying penalties and temperature.
+@@ -270,6 +276,15 @@ class RejectionSampler:
+         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+         pos = input_batch.positions[input_batch.logits_indices]
+ 
++        # Marking a draft invalid (`is_valid_draft = draft_sampled >= 0`) pins the
++        # accepted length before it reaches a permissive bitmask row. Only
++        # verification sees the copy: `apply_sampling_params` and watermarking
++        # keep the real draft ids.
++        verify_draft_sampled = draft_sampled
++        if invalid_draft_positions is not None:
++            verify_draft_sampled = draft_sampled.clone()
++            verify_draft_sampled[invalid_draft_positions] = -1
++
+         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
+             input_batch.idx_mapping_np
+         )
+@@ -282,6 +297,7 @@ class RejectionSampler:
+             pos,
+             chunk_logit_limit,
+             max_num_logprobs,
++            verify_draft_sampled,
+         )
+ 
+         num_sampled, num_rejected = get_num_sampled_and_rejected(

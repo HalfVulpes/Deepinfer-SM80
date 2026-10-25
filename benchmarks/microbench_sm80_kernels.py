@@ -36,7 +36,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
 )
 from vllm.models.deepseek_v4_1.amd.rocm import (
-    combine_topk_swa_indices as torch_combine_topk_swa_indices,
+    combine_topk_swa_indices as patched_combine_topk_swa_indices,
     compute_global_topk_ragged_indices_and_indptr,
 )
 
@@ -208,6 +208,7 @@ def test_mhc_optimizations():
     norm_weight = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
 
     for T in [1, 6, 12, 16, 32, 512, 1536, 4096]:
+        torch.cuda.empty_cache()
         x = torch.randn(T, hidden_size, dtype=torch.bfloat16, device=device)
         residual = torch.randn(T, hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
         post_mix = torch.sigmoid(torch.randn(T, hc_mult, 1, dtype=torch.float32, device=device))
@@ -250,6 +251,225 @@ def test_mhc_optimizations():
 # ============================================================================
 # 2. Sparse MLA Decode Partial Kernel (SM80 Unified 512-dim + Bitshift Scales)
 # ============================================================================
+@triton.jit
+def _sparse_attn_decode_partial_base_kernel(
+    q_ptr,
+    main_cache_ptr,
+    main_indices_ptr,
+    main_indptr_ptr,
+    extra_cache_ptr,
+    extra_indices_ptr,
+    extra_indptr_ptr,
+    part_m_ptr,
+    part_l_ptr,
+    part_acc_ptr,
+    fp8_lut_ptr,
+    q_stride0,
+    q_stride1,
+    main_cache_stride0,
+    extra_cache_stride0,
+    pm_stride0,
+    pm_stride_s,
+    pa_stride0,
+    pa_stride_s,
+    pa_stride_h,
+    main_num_rows,
+    extra_num_rows,
+    main_block_size: tl.constexpr,
+    extra_block_size: tl.constexpr,
+    scale,
+    num_heads: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    IS_FNUZ_MAIN: tl.constexpr,
+    IS_FNUZ_EXTRA: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """Unpatched 2-tile (448-NoPE + 64-RoPE + exp2 scale) baseline kernel for comparison."""
+    query_idx = tl.program_id(0)
+    split_id = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_offsets < num_heads
+    nope_offsets = tl.arange(0, NOPE_BLOCK)
+    nope_mask = nope_offsets < NOPE_DIM
+    rope_offsets = tl.arange(0, ROPE_DIM)
+
+    q_row_ptr = q_ptr + query_idx * q_stride0 + head_offsets[:, None] * q_stride1
+    q_nope = tl.load(
+        q_row_ptr + nope_offsets[None, :],
+        mask=head_mask[:, None] & nope_mask[None, :],
+        other=0.0,
+    )
+    q_rope = tl.load(
+        q_row_ptr + NOPE_DIM + rope_offsets[None, :],
+        mask=head_mask[:, None],
+        other=0.0,
+    )
+
+    neg_large = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc_nope = tl.zeros((BLOCK_H, NOPE_BLOCK), dtype=tl.float32)
+    acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
+    k_offsets = tl.arange(0, BLOCK_K)
+    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
+    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+
+    main_start = tl.load(main_indptr_ptr + query_idx)
+    main_end = tl.load(main_indptr_ptr + query_idx + 1)
+    main_len = main_end - main_start
+    main_chunk = (main_len + NUM_SPLITS - 1) // NUM_SPLITS
+    main_lo = split_id * main_chunk
+    main_hi = tl.minimum(main_lo + main_chunk, main_len)
+
+    for k_start in tl.range(main_lo, main_hi, BLOCK_K, num_stages=NUM_STAGES):
+        k_pos = k_start + k_offsets
+        in_range = k_pos < main_hi
+        slot = tl.load(main_indices_ptr + main_start + k_pos, mask=in_range, other=-1)
+        valid = in_range & (slot >= 0) & (slot < main_num_rows)
+        safe_slot = tl.where(valid, slot, 0)
+
+        block_idx = safe_slot // main_block_size
+        pos_in_block = safe_slot % main_block_size
+        cache_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
+        token_data_ptr = cache_block_ptr + pos_in_block * 576
+        token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
+
+        x_uint8 = tl.load(
+            token_data_ptr[:, None] + nope_offsets[None, :],
+            mask=valid[:, None] & nope_mask[None, :],
+            other=0,
+        )
+        k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr)
+        encoded_scales = tl.load(
+            token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+            mask=valid[:, None] & nope_mask[None, :],
+            other=127,
+        )
+        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+        k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+
+        rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+        k_rope = tl.load(
+            rope_ptr[:, None] + rope_offsets[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+        k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+        k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+
+        scores = (tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))) * scale
+        scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+        m_i = m_new
+        l_i = l_new
+
+    if HAS_EXTRA:
+        extra_start = tl.load(extra_indptr_ptr + query_idx)
+        extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
+        extra_len = extra_end - extra_start
+        extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
+        extra_lo = split_id * extra_chunk
+        extra_hi = tl.minimum(extra_lo + extra_chunk, extra_len)
+
+        for k_start in tl.range(extra_lo, extra_hi, BLOCK_K, num_stages=NUM_STAGES):
+            k_pos = k_start + k_offsets
+            in_range = k_pos < extra_hi
+            slot = tl.load(
+                extra_indices_ptr + extra_start + k_pos, mask=in_range, other=-1
+            )
+            valid = in_range & (slot >= 0) & (slot < extra_num_rows)
+            safe_slot = tl.where(valid, slot, 0)
+
+            block_idx = safe_slot // extra_block_size
+            pos_in_block = safe_slot % extra_block_size
+            cache_block_ptr = (
+                extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
+            )
+            token_data_ptr = cache_block_ptr + pos_in_block * 576
+            token_scale_ptr = (
+                cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
+            )
+
+            x_uint8 = tl.load(
+                token_data_ptr[:, None] + nope_offsets[None, :],
+                mask=valid[:, None] & nope_mask[None, :],
+                other=0,
+            )
+            k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr)
+            encoded_scales = tl.load(
+                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                mask=valid[:, None] & nope_mask[None, :],
+                other=127,
+            )
+            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+            k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+
+            rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+            k_rope = tl.load(
+                rope_ptr[:, None] + rope_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+            k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+
+            scores = (tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))) * scale
+            scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+
+            m_block = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_block)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+            l_new = l_i * alpha + tl.sum(p, axis=1)
+
+            acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+            acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+            m_i = m_new
+            l_i = l_new
+
+    pm_base = query_idx * pm_stride0 + split_id * pm_stride_s + head_offsets
+    tl.store(part_m_ptr + pm_base, m_i, mask=head_mask)
+    tl.store(part_l_ptr + pm_base, l_i, mask=head_mask)
+    acc_base = (
+        part_acc_ptr
+        + query_idx * pa_stride0
+        + split_id * pa_stride_s
+        + head_offsets[:, None] * pa_stride_h
+    )
+    tl.store(
+        acc_base + nope_offsets[None, :],
+        acc_nope,
+        mask=head_mask[:, None] & nope_mask[None, :],
+    )
+    tl.store(
+        acc_base + NOPE_DIM + rope_offsets[None, :],
+        acc_rope,
+        mask=head_mask[:, None],
+    )
+
+
 @triton.jit
 def _decode_e8m0_scales_bf16_triton(encoded_scales):
     # Bit-exact IEEE-754 bfloat16 construction for 2^(encoded_scales - 127)
@@ -491,13 +711,20 @@ def test_sparse_mla_decode():
     num_blocks = 256
     main_block_size = 64
     extra_block_size = 16
-    # Allocate realistic uint8 fp8_ds_mla cache (576B data + 8B scales per token)
-    swa_k_cache = torch.randint(0, 120, (num_blocks, main_block_size, 584), dtype=torch.uint8, device=device)
-    # Set scales to reasonable exponents around 125..128
-    swa_k_cache[:, :, 576:] = torch.randint(124, 129, (num_blocks, main_block_size, 8), dtype=torch.uint8, device=device)
+    # Allocate realistic uint8 fp8_ds_mla cache (block_size*576B data + block_size*8B scales per block)
+    raw_swa = torch.zeros((num_blocks, main_block_size * 584), dtype=torch.uint8, device=device)
+    swa_data = raw_swa[:, : main_block_size * 576].view(num_blocks, main_block_size, 576)
+    swa_data[:, :, :448] = torch.randint(0, 120, (num_blocks, main_block_size, 448), dtype=torch.uint8, device=device)
+    swa_data[:, :, 448:] = torch.randn(num_blocks, main_block_size, rope_dim, dtype=torch.bfloat16, device=device).view(torch.uint8)
+    raw_swa[:, main_block_size * 576 :] = torch.randint(117, 121, (num_blocks, main_block_size * 8), dtype=torch.uint8, device=device)
+    swa_k_cache = raw_swa.view(num_blocks, main_block_size, 584)
 
-    kv_cache = torch.randint(0, 120, (num_blocks, extra_block_size, 584), dtype=torch.uint8, device=device)
-    kv_cache[:, :, 576:] = torch.randint(124, 129, (num_blocks, extra_block_size, 8), dtype=torch.uint8, device=device)
+    raw_kv = torch.zeros((num_blocks, extra_block_size * 584), dtype=torch.uint8, device=device)
+    kv_data = raw_kv[:, : extra_block_size * 576].view(num_blocks, extra_block_size, 576)
+    kv_data[:, :, :448] = torch.randint(0, 120, (num_blocks, extra_block_size, 448), dtype=torch.uint8, device=device)
+    kv_data[:, :, 448:] = torch.randn(num_blocks, extra_block_size, rope_dim, dtype=torch.bfloat16, device=device).view(torch.uint8)
+    raw_kv[:, extra_block_size * 576 :] = torch.randint(117, 121, (num_blocks, extra_block_size * 8), dtype=torch.uint8, device=device)
+    kv_cache = raw_kv.view(num_blocks, extra_block_size, 584)
 
     attn_sink = torch.zeros(num_heads, dtype=torch.float32, device=device)
     fp8_lut = get_e4m3fn_bf16_lut(device)
@@ -521,32 +748,78 @@ def test_sparse_mla_decode():
             topk_indices, topk_lens, num_rows=num_blocks * extra_block_size
         )
 
-        def run_base():
-            rocm_sparse_attn_decode(
-                q=q,
-                kv_cache=kv_cache,
-                swa_k_cache=swa_k_cache,
-                swa_only=False,
-                topk_indices=None,
-                topk_lens=topk_lens,
-                swa_indices=swa_indices,
-                swa_lens=swa_lens,
-                swa_ragged_indices=swa_ragged_indices,
-                swa_ragged_indptr=swa_ragged_indptr,
-                topk_ragged_indices=topk_ragged_indices,
-                topk_ragged_indptr=topk_ragged_indptr,
-                attn_sink=attn_sink,
-                scale=scale,
-                head_dim=head_dim,
-                nope_head_dim=nope_dim,
-                rope_head_dim=rope_dim,
-                output=out_base,
-            )
-
         block_h = _decode_block_h(num_heads)
         heads_blocks = triton.cdiv(num_heads, block_h)
         block_k = 32
         num_splits = _decode_num_splits(B, heads_blocks, float(swa_len), float(topk_len), block_k)
+
+        def run_base():
+            part_m = torch.empty((B, num_splits, num_heads), dtype=torch.float32, device=device)
+            part_l = torch.empty_like(part_m)
+            part_acc = torch.empty((B, num_splits, num_heads, head_dim), dtype=torch.float32, device=device)
+            tmp_out = torch.empty_like(q)
+            _sparse_attn_decode_partial_base_kernel[(B, num_splits, heads_blocks)](
+                q,
+                swa_k_cache,
+                swa_ragged_indices,
+                swa_ragged_indptr,
+                kv_cache,
+                topk_ragged_indices,
+                topk_ragged_indptr,
+                part_m,
+                part_l,
+                part_acc,
+                fp8_lut,
+                q.stride(0),
+                q.stride(1),
+                swa_k_cache.stride(0),
+                kv_cache.stride(0),
+                part_m.stride(0),
+                part_m.stride(1),
+                part_acc.stride(0),
+                part_acc.stride(1),
+                part_acc.stride(2),
+                swa_k_cache.shape[0] * swa_k_cache.shape[1],
+                kv_cache.shape[0] * kv_cache.shape[1],
+                swa_k_cache.shape[1],
+                kv_cache.shape[1],
+                scale,
+                num_heads,
+                HAS_EXTRA=True,
+                NOPE_DIM=nope_dim,
+                NOPE_BLOCK=head_dim,
+                ROPE_DIM=rope_dim,
+                IS_FNUZ_MAIN=False,
+                IS_FNUZ_EXTRA=False,
+                BLOCK_H=block_h,
+                BLOCK_K=block_k,
+                NUM_SPLITS=num_splits,
+                NUM_STAGES=1,
+                num_warps=8,
+            )
+            _sparse_attn_decode_reduce_kernel[(B, num_heads)](
+                part_m,
+                part_l,
+                part_acc,
+                attn_sink,
+                tmp_out,
+                tmp_out.stride(0),
+                tmp_out.stride(1),
+                part_m.stride(0),
+                part_m.stride(1),
+                part_acc.stride(0),
+                part_acc.stride(1),
+                part_acc.stride(2),
+                num_heads,
+                HAS_ATTN_SINK=True,
+                ADAPTIVE_SPLITS=False,
+                COMB_DIM=head_dim,
+                BLOCK_H=1,
+                NUM_SPLITS=num_splits,
+                SPLITS_PAD=triton.next_power_of_2(num_splits),
+                num_warps=4,
+            )
+            out_base.copy_(tmp_out)
 
         def make_opt_runner(n_warps):
             def _run():
@@ -759,6 +1032,82 @@ def triton_combine_topk_swa_indices(
     return combined_indices, combined_lens
 
 
+def torch_combine_topk_swa_indices(
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    topk: int,
+    M: int,
+    N: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpatched baseline 12-op PyTorch implementation for speedup & parity comparison."""
+    topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
+    num_tokens = topk_indices.shape[0]
+    alignment = 128
+    combined_topk = ((topk + window_size + alignment - 1) // alignment) * alignment
+    combined_indices = torch.full(
+        (num_tokens, combined_topk),
+        fill_value=-1,
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    combined_lens = torch.empty(
+        num_tokens, dtype=torch.int32, device=topk_indices.device
+    )
+
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    req_ids = torch.repeat_interleave(
+        torch.arange(seq_lens.shape[0], device=seq_lens.device), query_lens
+    )
+    query_starts = query_start_loc[:-1] - query_start_loc[0]
+    token_offsets = torch.arange(num_tokens, device=seq_lens.device) - (
+        torch.repeat_interleave(query_starts, query_lens)
+    )
+    positions = seq_lens[req_ids] - query_lens[req_ids] + token_offsets
+
+    logical_topk_width = min(topk, topk_indices.shape[1])
+    topk_lens = torch.minimum(
+        (positions + 1) // compress_ratio,
+        torch.full_like(positions, logical_topk_width),
+    ).clamp_min(0)
+    topk_offsets = torch.arange(logical_topk_width, device=seq_lens.device)
+    topk_mask = topk_offsets[None, :] < topk_lens[:, None]
+    topk_values = topk_indices[:, :logical_topk_width].to(torch.int32)
+    topk_valid = topk_mask & (topk_values >= 0) & (topk_values < N)
+    combined_indices[:, :logical_topk_width] = torch.where(
+        topk_valid,
+        topk_values + (M * req_ids).to(torch.int32)[:, None],
+        -1,
+    )
+
+    swa_lens = torch.minimum(
+        positions + 1, torch.full_like(positions, window_size)
+    ).clamp_min(0)
+    swa_offsets = torch.arange(window_size, device=seq_lens.device)
+    swa_mask = swa_offsets[None, :] < swa_lens[:, None]
+    swa_columns = topk_lens[:, None] + swa_offsets[None, :]
+    gather_starts = seq_lens - gather_lens
+    swa_values = (
+        M * req_ids[:, None]
+        + N
+        + swa_offsets[None, :]
+        + positions[:, None]
+        - swa_lens[:, None]
+        + 1
+        - gather_starts[req_ids, None]
+    ).to(torch.int32)
+    rows = torch.arange(num_tokens, device=seq_lens.device)[:, None].expand_as(
+        swa_columns
+    )
+    flat_dst = rows[swa_mask] * combined_topk + swa_columns[swa_mask]
+    combined_indices.view(-1).index_copy_(0, flat_dst, swa_values[swa_mask])
+    combined_lens.copy_((topk_lens + swa_lens).to(torch.int32))
+    return combined_indices, combined_lens
+
+
 def test_combine_topk_swa():
     print("\n" + "=" * 80)
     print("BENCHMARK 3: combine_topk_swa_indices (30x per prefill chunk)")
@@ -781,7 +1130,7 @@ def test_combine_topk_swa():
             topk_indices, query_start_loc, seq_lens, gather_lens,
             window_size, compress_ratio, topk, M, N
         )
-        idx_tri, len_tri = triton_combine_topk_swa_indices(
+        idx_tri, len_tri = patched_combine_topk_swa_indices(
             topk_indices, query_start_loc, seq_lens, gather_lens,
             window_size, compress_ratio, topk, M, N
         )
@@ -797,7 +1146,7 @@ def test_combine_topk_swa():
             warmup=20, rep=100,
         )
         t_tri = bench_fn(
-            lambda: triton_combine_topk_swa_indices(
+            lambda: patched_combine_topk_swa_indices(
                 topk_indices, query_start_loc, seq_lens, gather_lens,
                 window_size, compress_ratio, topk, M, N
             ),

@@ -131,6 +131,14 @@ DeepSeek-V4.1 executes `mHC` 4-stream residual routing (`hc_mult = 4`, `hidden_s
 - In DeepSeek-V4.1's You-Only-Cache-Once (`YOCO`) architecture, Layers `21–39` (`shared_kv_source_layer = 20`, `compress_ratio = 1`) all read from Layer 20's full-resolution KV cache and share identical `seq_lens_expanded`, `block_table`, and `compress_ratio`.
 - Caching `(k_ragged_offset, k_ragged_SlotMapping, total_k)` in `forward_context` at `L20` eliminates **19 redundant `build_ragged_k_Metadata` GPU kernel chains per prefill chunk**.
 
+### 6. Multi-Stage Pipeline Parallelism (`TP2 × PP3` & `TP4 × PP2`), Cross-PP Shared KV (`pp_share.py`), & 1M Streamed Indexer
+**Files:** [`vllm/models/deepseek_v4_1/pp_share.py`](vllm_sm80_deepinfer/vllm/models/deepseek_v4_1/pp_share.py), [`vllm/v1/attention/ops/mqa_logits_candidates_triton.py`](vllm_sm80_deepinfer/vllm/v1/attention/ops/mqa_logits_candidates_triton.py), [`vllm/v1/attention/backends/mla/streamed_workspace.py`](vllm_sm80_deepinfer/vllm/v1/attention/backends/mla/streamed_workspace.py), [`vllm/models/deepseek_v4_1/nvidia/dspark.py`](vllm_sm80_deepinfer/vllm/models/deepseek_v4_1/nvidia/dspark.py)
+
+- **Arbitrary Pipeline Partitions Across Shared YOCO Groups (`PPSharePlan`)**: Upstream DeepSeek-V4.1 requires an entire KV-sharing group (`L20–L39`) to reside on a single PP stage, which prevents 3-stage `TP2 × PP3` (`14,14,12`) partitions. `PPSharePlan` (`pp_share.py`) registers byte-identical `CompressedKVReplica` and `DeepseekV4IndexerCache` stand-ins on downstream PP ranks and ships only the newly written `584 B` compressed KV rows, `132 B` indexer K rows, candidate blocks, and top-k indices inside `IntermediateTensors`. Under `TP4 × PP2` (`20,20`), `L20–L39` all reside on `PP1`, so `PPSharePlan` automatically reduces cross-stage `L20` KV shipping to zero.
+- **Candidate-Only Triton Indexer Scoring (`mqa_logits_candidates_triton.py`)**: On consumer index layers (`L24/28/32/36`), scores only the `candidate_topk_blocks` published by `L20` instead of the full `[rows, max_seq_len]` context before masking (`8×` fewer scored columns at `128K`, `64×` fewer at `1M`).
+- **Bounded 1M-Context Indexer Workspace & Exact-Size Pinned Engram Tables**: `streamed_workspace.py` bounds prefill gather buffers to one window (`~135 MB` instead of `40 × 1M × 132 B = 5.28 GB`), while `common/engram.py` + `weight_utils.py` pin exact-size host Engram shards via `cudaHostRegister` and multi-threaded `pread` without `mmap` OOMs.
+- **TP-Sharded DSpark on PP (`nvidia/dspark.py`, `spec_decode/dspark/utils.py`, `model_runner.py`)**: Enables `DSpark K=5` speculative decoding on `TP2 × PP3` and `TP4 × PP2` with `VocabParallelEmbedding` shard loading, non-first-rank `input_ids` propagation, and structured-output grammar draft masking.
+
 ---
 
 ## Supported Hardware
@@ -151,18 +159,28 @@ Deepinfer-SM80/
 ├── CITATION.cff                       # Citation metadata (DeepInfer-SM80, DeepInfer, vLLM)
 ├── patches/
 │   ├── 00-vllm-pr56201-sm80-base.patch # Base SM80 enablement patch on top of vllm PR #56201 (79a7108d9a)
-│   └── vllm-sm80-deepinfer.patch      # DeepInfer-SM80 kernel & YOCO optimization patch (all 6 files, 1,529 lines)
-├── vllm_sm80_deepinfer/               # Drop-in optimized vLLM Python/Triton/TileLang modules
+│   └── vllm-sm80-deepinfer.patch      # Complete DeepInfer-SM80 + PP/DSpark/1M-context patch (30 files, 4,289 lines)
+├── vllm_sm80_deepinfer/               # Drop-in optimized vLLM Python/Triton/TileLang modules (all 30 files)
 │   └── vllm/
-│       ├── model_executor/kernels/mhc/
-│       │   ├── tilelang.py            # SM80-aligned TileLang mHC FMA & Tensor Core kernels
-│       │   └── warmup.py              # Startup JIT cache warming for split=4,8,16 configs
+│       ├── model_executor/
+│       │   ├── kernels/mhc/{tilelang.py, warmup.py}  # SM80-aligned TileLang mHC kernels & warmup
+│       │   ├── layers/sparse_attn_indexer.py         # Candidate-only Triton scoring for L24/28/32/36
+│       │   ├── model_loader/weight_utils.py          # Non-mmap pread loader for skipped Engram shards
+│       │   └── models/qwen3_dspark.py                # DSpark confidence head & top-token helpers
 │       ├── models/deepseek_v4_1/
-│       │   ├── amd/rocm.py            # Single-CTA bit-exact _combine_topk_swa_indices_kernel
-│       │   ├── common/ops/cache_utils.py # Bitshift UE8M0 + direct-store KV gather kernels
-│       │   └── nvidia/model.py        # YOCO L20–L39 ragged indexer metadata reuse
-│       └── v1/attention/ops/
-│           └── rocm_aiter_mla_sparse.py  # Unified 512-dim SM80 Sparse MLA decode/prefill kernels
+│       │   ├── amd/rocm.py                           # Single-CTA bit-exact _combine_topk_swa_indices_kernel
+│       │   ├── ampere/ampere_sparse.py               # SM80 SWA metadata builder (no FlashMLA dependency)
+│       │   ├── attention.py                          # Per-head Triton indexer warmup
+│       │   ├── common/engram.py                      # Exact-size cudaHostRegister + C pthread pread gather
+│       │   ├── common/ops/cache_utils.py             # Bitshift UE8M0 + direct-store KV gather kernels
+│       │   ├── nvidia/{model.py, vl_model.py, dspark.py} # YOCO metadata reuse, PP input_ids, TP-sharded DSpark
+│       │   └── pp_share.py                           # Cross-PP YOCO shared KV / indexer-K / candidate replication
+│       └── v1/
+│           ├── attention/backends/{utils.py, mla/indexer.py, mla/streamed_workspace.py}
+│           ├── attention/ops/{rocm_aiter_mla_sparse.py, mqa_logits_candidates_triton.py}
+│           ├── core/{kv_cache_utils.py, single_type_kv_cache_manager.py, sched/*}
+│           ├── structured_output/utils.py
+│           └── worker/gpu/{model_runner.py, cudagraph_utils.py, sample/batch_shard.py, spec_decode/*}
 ├── benchmarks/
 │   ├── microbench_sm80_kernels.py     # Isolated SM80 microbenchmark: Sparse MLA & KV gather
 │   ├── microbench_sm80_part2.py       # Isolated SM80 microbenchmark: TileLang mHC kernels
@@ -214,7 +232,7 @@ If you are already running the SM80 base branch (`11cf4a67f9` on top of `79a7108
 ```bash
 git apply /path/to/Deepinfer-SM80/patches/vllm-sm80-deepinfer.patch
 ```
-Or copy/bind-mount the 6 drop-in files directly into your `vllm` Python package directory:
+Or copy/bind-mount all 30 drop-in files directly into your `vllm` Python package directory:
 ```bash
 cp -r vllm_sm80_deepinfer/vllm/* /path/to/site-packages/vllm/
 ```

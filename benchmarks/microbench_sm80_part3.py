@@ -35,6 +35,7 @@ from microbench_sm80_kernels import (
     _decode_e8m0_scales_bf16_triton,
 )
 from microbench_sm80_part2 import (
+    dequantize_and_gather_k_cache_baseline,
     dequantize_and_gather_k_cache_sm80,
 )
 
@@ -68,10 +69,10 @@ def test_dequant_bit_exact():
         seq_lens = torch.tensor([n_compressed], dtype=torch.int32, device=device)
         block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).unsqueeze(0)
 
-        dequantize_and_gather_k_cache_triton(
+        dequantize_and_gather_k_cache_baseline(
             out_ref, k_cache, seq_lens, None, block_table, block_size, 0, False
         )
-        dequantize_and_gather_k_cache_sm80(
+        dequantize_and_gather_k_cache_triton(
             out_opt, k_cache, seq_lens, None, block_table, block_size, 0, False
         )
         bit_exact = torch.equal(out_ref.view(torch.uint16), out_opt.view(torch.uint16))
