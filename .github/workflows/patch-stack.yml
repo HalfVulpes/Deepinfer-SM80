@@ -4,11 +4,17 @@ name: patch-stack
 #
 #   * both patches apply to the documented vLLM base commit
 #   * after patching, the tree contains the modules the patches promise
-#     (including ppv_share.py, the file missing in issue #2)
+#     (including pp_share.py, the file missing in issue #2)
 #   * the patched tree is byte-identical to the published drop-in directory
 #
 # This is the regression that issues #1 and #2 actually reported: the code was
 # fine, but the installation path was not reproducible.
+#
+# Fetching note: the base commit 79a7108d9a belongs to the (closed, unmerged)
+# vLLM PR #56201 and is NOT directly fetchable by SHA from vllm-project/vllm
+# any more ("upload-server: not our ref"). It is, however, an ancestor of
+# refs/pull/56201/head, so the workflow fetches that ref first and then checks
+# the base commit out of its history.
 
 on:
   push:
@@ -25,9 +31,20 @@ jobs:
           VLLM_BASE: 79a7108d9aea27ddab99ce1779290d300b17fc23
         run: |
           set -euo pipefail
-          git clone --filter=blob:none --no-checkout https://github.com/vllm-project/vllm.git /tmp/vllm
-          git -C /tmp/vllm fetch --depth 1 origin "${VLLM_BASE}"
-          git -C /tmp/vllm checkout "${VLLM_BASE}"
+          mkdir -p /tmp/vllm
+          git -C /tmp/vllm init -q
+          git -C /tmp/vllm remote add origin https://github.com/vllm-project/vllm.git
+          # blobless so the historical tree is available without the full pack
+          git -C /tmp/vllm fetch -q --filter=blob:none --no-tags \
+            origin refs/pull/56201/head
+          git -C /tmp/vllm checkout -q -f "${VLLM_BASE}"
+
+      - name: Show what we are testing against
+        run: |
+          set -euo pipefail
+          git -C /tmp/vllm log --oneline -1
+          echo "tracked files: $(git -C /tmp/vllm ls-files | wc -l)"
+          test -f /tmp/vllm/vllm/models/deepseek_v4_1/attention.py
 
       - name: Dry-run the patch stack
         run: bash scripts/apply_patches.sh --vllm-dir /tmp/vllm --dry-run
