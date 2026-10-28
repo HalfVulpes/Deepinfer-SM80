@@ -158,3 +158,20 @@ both patches to the exact base reproduces every published Python module
 byte-for-byte, which is the property issues #1 and #2 were really asking for.
 Kernel-level benchmarks still have to run on real hardware; see
 `benchmarks/results/` for the archived runs.
+
+### 9.1 Independent measurement — A800-SXM4-80GB
+
+First reported run on 108-SM Ampere silicon (`sms: 108` in the archived
+`env.txt`; the docs and benchmark headers in this repository say 74 SMs).
+Archive: `benchmarks/results/20261027-a800-80gb-108sm/`.
+
+| Kernel | This run | README claim |
+| :--- | :--- | :--- |
+| mHC fused post+pre (`T=12`) | 506.3 → 210.3 µs (2.41×) | 357.7 → 123.8 µs (2.89×) |
+| Sparse MLA decode `B=1..24` | 1.15–1.24×, err ≤ 4.9e-04 | 2.08–2.14× |
+| `combine_topk_swa` (`T=512..4096`) | 26.4–30.0×, bit-exact | 22.17× |
+| `dequantize_and_gather_k_cache` (1K–12K) | 1.59–8.92× per call, bit-exact | 4.02× @16K, 7.64× @48K |
+
+All three scripts ran on one A800-80GB. `microbench_sm80_part3.py` stops at
+`TEST 2` with `TypeError: unsupported format string passed to NoneType` because
+`default_t` is never assigned for `B >= 16`; `TEST 1` (bit-exactness) passes.

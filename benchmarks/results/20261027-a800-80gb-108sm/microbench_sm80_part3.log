@@ -1,0 +1,22 @@
+WARNING 10-27 23:48:30 [rocm.py:42] Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+WARNING 10-27 23:48:30 [rocm.py:47] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 10-27 23:48:30 [rocm.py:58] Failed to import from vllm._rocm_C with ModuleNotFoundError("No module named 'vllm._rocm_C'")
+WARNING 10-27 23:48:30 [rocm.py:134] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+================================================================================
+TEST 1: dequantize_and_gather_k_cache_sm80 Bit-Exact Verification
+================================================================================
+n_compressed= 1024 | Bit-exact (uint16): True | max_abs_err: 0.00e+00
+n_compressed= 4096 | Bit-exact (uint16): True | max_abs_err: 0.00e+00
+n_compressed=12288 | Bit-exact (uint16): True | max_abs_err: 0.00e+00
+
+================================================================================
+TEST 2: Decode Split & Warp Tuning on GA100 (74 SMs)
+================================================================================
+B= 1 | Default (s=16, w=8):  69.71 us | Best (s=12, w=8):  69.02 us (1.01x)
+Traceback (most recent call last):
+  File "/data2/group_何向南/concise/models/Deepinfer-SM80-clone-20261027/benchmarks/microbench_sm80_part3.py", line 370, in <module>
+    test_decode_splits_sweep()
+  File "/data2/group_何向南/concise/models/Deepinfer-SM80-clone-20261027/benchmarks/microbench_sm80_part3.py", line 174, in test_decode_splits_sweep
+    f"B={B:2d} | Default (s={default_s:2d}, w=8): {default_t:6.2f} us | "
+                                                  ^^^^^^^^^^^^^^^^
+TypeError: unsupported format string passed to NoneType.__format__

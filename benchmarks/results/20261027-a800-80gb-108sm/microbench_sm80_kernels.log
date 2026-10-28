@@ -1,0 +1,38 @@
+WARNING 10-27 23:46:44 [rocm.py:42] Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+WARNING 10-27 23:46:44 [rocm.py:47] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 10-27 23:46:44 [rocm.py:58] Failed to import from vllm._rocm_C with ModuleNotFoundError("No module named 'vllm._rocm_C'")
+WARNING 10-27 23:46:44 [rocm.py:134] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+================================================================================
+BENCHMARK 1: mHC Boundary Pair (83x per step in Target + DSpark)
+================================================================================
+2026-10-27 23:46:45  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_pre_big_fuse_with_norm_tilelang` with `out_idx=None`
+2026-10-27 23:46:58  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_pre_big_fuse_with_norm_tilelang`
+2026-10-27 23:46:59  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_fused_tilelang` with `out_idx=None`
+2026-10-27 23:47:00  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_fused_tilelang`
+2026-10-27 23:47:01  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_pre_big_fuse_with_norm_tilelang` with `out_idx=None`
+2026-10-27 23:47:12  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_pre_big_fuse_with_norm_tilelang`
+T=   1 | Base:  371.28 us | Fused:  182.22 us | Speedup:  2.04x | 83-boundary save:  15.69 ms | err(res=0.0e+00, li=0.0e+00, npm=1.1e-03)
+T=   6 | Base:  176.23 us | Fused:  119.36 us | Speedup:  1.48x | 83-boundary save:   4.72 ms | err(res=0.0e+00, li=0.0e+00, npm=2.8e-03)
+2026-10-27 23:47:13  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_fused_tilelang` with `out_idx=None`
+2026-10-27 23:47:15  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_fused_tilelang`
+T=  12 | Base:  506.33 us | Fused:  210.32 us | Speedup:  2.41x | 83-boundary save:  24.57 ms | err(res=0.0e+00, li=0.0e+00, npm=2.1e-03)
+T=  16 | Base:  190.32 us | Fused:  130.72 us | Speedup:  1.46x | 83-boundary save:   4.95 ms | err(res=0.0e+00, li=0.0e+00, npm=2.0e-03)
+T=  32 | Base:  218.05 us | Fused:  167.21 us | Speedup:  1.30x | 83-boundary save:   4.22 ms | err(res=0.0e+00, li=0.0e+00, npm=1.2e-07)
+T= 512 | Base:  221.13 us | Fused:  172.35 us | Speedup:  1.28x | 83-boundary save:   4.05 ms | err(res=0.0e+00, li=0.0e+00, npm=1.2e-07)
+T=1536 | Base:  237.70 us | Fused:  207.91 us | Speedup:  1.14x | 83-boundary save:   2.47 ms | err(res=0.0e+00, li=0.0e+00, npm=1.2e-07)
+T=4096 | Base:  576.44 us | Fused:  481.67 us | Speedup:  1.20x | 83-boundary save:   7.87 ms | err(res=0.0e+00, li=0.0e+00, npm=1.2e-07)
+
+================================================================================
+BENCHMARK 2: Sparse MLA Decode (41x per decode step in Target + DSpark)
+================================================================================
+B= 1 (splits=16) | Base:   84.40 us | SM80-w8:   68.70 us (1.23x, err=0.0e+00) | SM80-w4:   68.25 us (1.24x, err=0.0e+00)
+B= 6 (splits= 8) | Base:   85.75 us | SM80-w8:   69.58 us (1.23x, err=0.0e+00) | SM80-w4:   70.02 us (1.22x, err=0.0e+00)
+B=12 (splits= 4) | Base:  134.19 us | SM80-w8:  112.64 us (1.19x, err=4.9e-04) | SM80-w4:  116.07 us (1.16x, err=4.9e-04)
+B=24 (splits= 2) | Base:  252.36 us | SM80-w8:  213.35 us (1.18x, err=9.8e-04) | SM80-w4:  219.25 us (1.15x, err=9.8e-04)
+
+================================================================================
+BENCHMARK 3: combine_topk_swa_indices (30x per prefill chunk)
+================================================================================
+T= 512 | Torch (12 ops): 1037.88 us | Triton (1 op):   39.26 us | Speedup: 26.43x | Bit-exact: True
+T=1536 | Torch (12 ops): 1079.71 us | Triton (1 op):   39.80 us | Speedup: 27.13x | Bit-exact: True
+T=4096 | Torch (12 ops): 1197.87 us | Triton (1 op):   39.88 us | Speedup: 30.04x | Bit-exact: True
