@@ -103,7 +103,15 @@ if [ "$DRY_RUN" -eq 1 ]; then
   # Validate the stacked patches against a private copy of the index.
   TMP_INDEX="$(mktemp)"
   trap 'rm -f "$TMP_INDEX"' EXIT
-  cp "$(git -C "$VLLM_DIR" rev-parse --git-path index)" "$TMP_INDEX"
+  # `rev-parse --git-path index` is relative for a normal clone and absolute
+  # for a linked worktree; anchor it so a normal clone does not copy the cwd's
+  # index (which is what made this fail on CI but pass in a worktree).
+  SRC_INDEX="$(git -C "$VLLM_DIR" rev-parse --git-path index)"
+  case "$SRC_INDEX" in
+    /*) ;;
+    *) SRC_INDEX="$VLLM_DIR/$SRC_INDEX" ;;
+  esac
+  cp "$SRC_INDEX" "$TMP_INDEX"
   export GIT_INDEX_FILE="$TMP_INDEX"
   for p in "${PATCHES[@]}"; do
     echo
