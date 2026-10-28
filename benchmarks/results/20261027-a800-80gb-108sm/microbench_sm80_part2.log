@@ -1,0 +1,20 @@
+WARNING 10-27 23:48:02 [rocm.py:42] Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+WARNING 10-27 23:48:02 [rocm.py:47] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 10-27 23:48:02 [rocm.py:58] Failed to import from vllm._rocm_C with ModuleNotFoundError("No module named 'vllm._rocm_C'")
+WARNING 10-27 23:48:02 [rocm.py:134] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+================================================================================
+CHECK 1: Sparse MLA Decode Parity Across All Batch Sizes (B=1..32)
+================================================================================
+B= 1 (splits=16, warps=8) | Base:   83.75 us | SM80-Opt:   68.04 us | Speedup:  1.23x | max_abs_err: 0.00e+00
+B= 4 (splits=11, warps=4) | Base:   84.09 us | SM80-Opt:   68.17 us | Speedup:  1.23x | max_abs_err: 0.00e+00
+B= 6 (splits= 8, warps=4) | Base:   84.50 us | SM80-Opt:   68.52 us | Speedup:  1.23x | max_abs_err: 4.88e-04
+B=12 (splits= 4, warps=4) | Base:  134.17 us | SM80-Opt:  115.82 us | Speedup:  1.16x | max_abs_err: 4.88e-04
+B=16 (splits= 3, warps=4) | Base:  181.71 us | SM80-Opt:  158.39 us | Speedup:  1.15x | max_abs_err: 4.88e-04
+B=24 (splits= 2, warps=4) | Base:  252.26 us | SM80-Opt:  219.85 us | Speedup:  1.15x | max_abs_err: 4.88e-04
+
+================================================================================
+CHECK 2: dequantize_and_gather_k_cache (38x per prefill chunk)
+================================================================================
+Compressed tokens= 1024 | Base:   29.12 us | SM80-LUT:   18.32 us (1.59x) | 38-layer->8-source:  1.11 ms ->  0.15 ms (7.55x) | Bit-exact: True (err=0.0e+00)
+Compressed tokens= 4096 | Base:  104.94 us | SM80-LUT:   18.26 us (5.75x) | 38-layer->8-source:  3.99 ms ->  0.15 ms (27.30x) | Bit-exact: True (err=0.0e+00)
+Compressed tokens=12288 | Base:  304.82 us | SM80-LUT:   34.18 us (8.92x) | 38-layer->8-source: 11.58 ms ->  0.27 ms (42.36x) | Bit-exact: True (err=0.0e+00)

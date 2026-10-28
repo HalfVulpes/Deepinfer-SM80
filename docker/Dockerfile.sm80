@@ -1,0 +1,67 @@
+# DeepInfer-SM80 build image (NVIDIA Ampere / SM80).
+#
+# Bakes: CUDA 13.0 devel + Python 3.12 + GCC 13, the exact vLLM base commit the
+# patches target, both patches applied, and an editable build with
+# VLLM_SM80_ONLY=1 so the Hopper/Blackwell extension targets are never compiled.
+#
+# NOTE: this recipe mirrors the steps verified on a real A800-80GB host
+# (see REPRODUCTION.md). The image build itself has NOT been validated
+# end-to-end yet -- treat it as a reproducible starting point, not a guarantee.
+#
+# Build:
+#   docker build -f docker/Dockerfile.sm80 -t deepinfer-sm80:cu130 .
+# Smoke test (one GPU):
+#   docker run --rm --gpus all deepinfer-sm80:cu130 python scripts/verify_env.py
+
+ARG CUDA_VERSION=13.0.0
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# vLLM PR #56201 commit that both patches are based on.
+ARG VLLM_BASE_COMMIT=79a7108d9aea27ddab99ce1779290d300b17fc23
+# 8.0 = A100/A800, 8.6 = RTX 3090 / RTX A6000.
+ARG TORCH_CUDA_ARCH_LIST="8.0 8.6"
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        gcc-13 \
+        g++-13 \
+        libnuma-dev \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:$PATH
+ENV VIRTUAL_ENV=/opt/venv
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir cmake ninja "setuptools-scm>=8" packaging \
+    && pip install --no-cache-dir torch==2.13.0 \
+        --index-url https://download.pytorch.org/whl/cu130
+
+WORKDIR /workspace
+COPY . /workspace/Deepinfer-SM80
+
+RUN git clone https://github.com/vllm-project/vllm.git /workspace/vllm \
+    && git -C /workspace/vllm checkout "${VLLM_BASE_COMMIT}"
+
+RUN bash /workspace/Deepinfer-SM80/scripts/apply_patches.sh --vllm-dir /workspace/vllm
+
+# SM80-only build: drops _vllm_fa3_C, _flashmla_C, _flashmla_extension_C,
+# _flashkda_C, _deep_gemm_C, _qutlass_C, fmha_sm100 and tml_fa4, all of which
+# are Hopper/Blackwell-only targets that cannot compile on sm_80.
+ENV VLLM_SM80_ONLY=1
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+RUN cd /workspace/vllm && pip install --no-cache-dir -e . --no-build-isolation
+
+WORKDIR /workspace/Deepinfer-SM80
+CMD ["python", "scripts/verify_env.py"]
