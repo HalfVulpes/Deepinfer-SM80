@@ -1,0 +1,24 @@
+WARNING 10-28 20:23:19 [rocm.py:42] Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+WARNING 10-28 20:23:19 [rocm.py:47] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 10-28 20:23:19 [rocm.py:58] Failed to import from vllm._rocm_C with ModuleNotFoundError("No module named 'vllm._rocm_C'")
+================================================================================
+TEST 1: dequantize_and_gather_k_cache_sm80 Bit-Exact Verification
+================================================================================
+n_compressed= 1024 | Bit-exact (uint16): True | max_abs_err: 0.00e+00
+n_compressed= 4096 | Bit-exact (uint16): True | max_abs_err: 0.00e+00
+n_compressed=12288 | Bit-exact (uint16): True | max_abs_err: 0.00e+00
+
+================================================================================
+TEST 2: Decode Split & Warp Tuning on GA100 (74 SMs)
+================================================================================
+B= 1 | Default (s=16, w=8):  92.12 us | Best (s=16, w=4):  91.98 us (1.00x)
+B= 4 | Default (s=11, w=8):  92.88 us | Best (s=16, w=4):  91.32 us (1.02x)
+B= 6 | Default (s= 8, w=8):  91.57 us | Best (s=16, w=4):  91.10 us (1.01x)
+B=12 | Default (s= 4, w=8):  92.18 us | Best (s=16, w=4):  91.32 us (1.01x)
+B=16 | Default (s= 3, w=8): 125.30 us | Best (s= 6, w=4):  96.85 us (1.29x)
+B=24 | Default (s= 2, w=8): 173.02 us | Best (s= 4, w=4): 125.79 us (1.38x)
+
+================================================================================
+TEST 3: Sparse MLA Prefill Attention (Direct-Out + Ragged Reuse + Constexpr)
+================================================================================
+T=1536 | Base consumer: 2244.26 us | SM80 consumer: 2214.50 us | Speedup:  1.01x | 30-consumer save:  0.89 ms/chunk | Bit-exact: True (err=0.00e+00)

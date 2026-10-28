@@ -1,0 +1,19 @@
+WARNING 10-28 20:22:55 [rocm.py:42] Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+WARNING 10-28 20:22:55 [rocm.py:47] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 10-28 20:22:55 [rocm.py:58] Failed to import from vllm._rocm_C with ModuleNotFoundError("No module named 'vllm._rocm_C'")
+================================================================================
+CHECK 1: Sparse MLA Decode Parity Across All Batch Sizes (B=1..32)
+================================================================================
+B= 1 (splits=16, warps=8) | Base:  113.22 us | SM80-Opt:   91.08 us | Speedup:  1.24x | max_abs_err: 0.00e+00
+B= 4 (splits=11, warps=4) | Base:  115.29 us | SM80-Opt:   91.65 us | Speedup:  1.26x | max_abs_err: 0.00e+00
+B= 6 (splits= 8, warps=4) | Base:  114.94 us | SM80-Opt:   92.47 us | Speedup:  1.24x | max_abs_err: 4.88e-04
+B=12 (splits= 4, warps=4) | Base:  133.61 us | SM80-Opt:  115.08 us | Speedup:  1.16x | max_abs_err: 4.88e-04
+B=16 (splits= 3, warps=4) | Base:  179.42 us | SM80-Opt:  156.77 us | Speedup:  1.14x | max_abs_err: 4.88e-04
+B=24 (splits= 2, warps=4) | Base:  249.74 us | SM80-Opt:  216.58 us | Speedup:  1.15x | max_abs_err: 4.88e-04
+
+================================================================================
+CHECK 2: dequantize_and_gather_k_cache (38x per prefill chunk)
+================================================================================
+Compressed tokens= 1024 | Base:   34.37 us | SM80-LUT:   23.70 us (1.45x) | 38-layer->8-source:  1.31 ms ->  0.19 ms (6.89x) | Bit-exact: True (err=0.0e+00)
+Compressed tokens= 4096 | Base:   84.54 us | SM80-LUT:   29.54 us (2.86x) | 38-layer->8-source:  3.21 ms ->  0.24 ms (13.59x) | Bit-exact: True (err=0.0e+00)
+Compressed tokens=12288 | Base:  248.21 us | SM80-LUT:   28.20 us (8.80x) | 38-layer->8-source:  9.43 ms ->  0.23 ms (41.81x) | Bit-exact: True (err=0.0e+00)

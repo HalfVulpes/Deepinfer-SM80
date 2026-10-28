@@ -135,7 +135,8 @@ def test_decode_splits_sweep():
         default_s = _decode_num_splits(B, heads_blocks, float(swa_len), float(topk_len), block_k)
         default_t = None
 
-        for num_splits in [2, 3, 4, 6, 8, 12, 16]:
+        # default_s can fall outside the sweep (e.g. 1 at large B); always time it.
+        for num_splits in sorted({2, 3, 4, 6, 8, 12, 16, default_s}):
             for n_warps in [4, 8]:
                 def _run():
                     part_m = torch.empty((B, num_splits, num_heads), dtype=torch.float32, device=device)

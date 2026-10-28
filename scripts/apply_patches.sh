@@ -70,6 +70,7 @@ if [ "$HEAD_SHA" != "$BASE_COMMIT" ]; then
   echo
   echo "error: HEAD is not the documented base commit." >&2
   echo "       expected $BASE_COMMIT (vLLM PR #56201, v0.28.1rc0 base)" >&2
+  echo "       fetch it with: git fetch origin refs/pull/56201/head" >&2
   echo "       upstream PR #56741 renamed vllm/models/deepseek_v4_1/ ->" >&2
   echo "       vllm/models/deepseek_v41/, so newer trees will not apply." >&2
   if git -C "$VLLM_DIR" cat-file -e "$BASE_COMMIT^{commit}" 2>/dev/null; then
@@ -159,7 +160,7 @@ fi
 
 echo
 echo "==> build with:"
-echo "    export VLLM_SM80_ONLY=1        # skip Hopper/Blackwell extension targets"
-echo "    export TORCH_CUDA_ARCH_LIST='8.0 8.6'"
+echo "    export TORCH_CUDA_ARCH_LIST='8.0 8.6'   # Hopper/Blackwell-only targets are skipped"
+echo "    pip install -r requirements/build/cuda.txt"
 echo "    pip install -e . --no-build-isolation"
 exit 0

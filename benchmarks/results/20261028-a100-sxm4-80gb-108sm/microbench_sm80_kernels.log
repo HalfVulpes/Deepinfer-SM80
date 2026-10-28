@@ -1,0 +1,45 @@
+WARNING 10-28 20:21:39 [rocm.py:42] Failed to import from amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+WARNING 10-28 20:21:39 [rocm.py:47] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 10-28 20:21:39 [rocm.py:58] Failed to import from vllm._rocm_C with ModuleNotFoundError("No module named 'vllm._rocm_C'")
+[20:21:40] : Warning: T.vectorized loop over `i_hci` with extent 4 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+[20:22:16] : Warning: T.vectorized loop over `i_hci` with extent 4 is lowered as a serial loop because TileLang could not find a valid vectorization plan. Scalar accumulator updates inside the loop are a common cause; move reductions to T.unroll or T.serial if this is intended.
+================================================================================
+BENCHMARK 1: mHC Boundary Pair (83x per step in Target + DSpark)
+================================================================================
+2026-10-28 20:21:39  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_post_tilelang` with `out_idx=None`
+2026-10-28 20:21:41  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_post_tilelang`
+2026-10-28 20:21:42  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `hc_prenorm_gemm_tilelang` with `out_idx=None`
+2026-10-28 20:21:43  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `hc_prenorm_gemm_tilelang`
+2026-10-28 20:21:44  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_pre_big_fuse_with_norm_tilelang` with `out_idx=None`
+2026-10-28 20:21:56  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_pre_big_fuse_with_norm_tilelang`
+2026-10-28 20:21:57  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_fused_tilelang` with `out_idx=None`
+2026-10-28 20:21:58  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_fused_tilelang`
+2026-10-28 20:21:59  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_pre_big_fuse_with_norm_tilelang` with `out_idx=None`
+2026-10-28 20:22:11  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_pre_big_fuse_with_norm_tilelang`
+T=   1 | Base:  192.01 us | Fused:  146.18 us | Speedup:  1.31x | 83-boundary save:   3.80 ms | err(res=0.0e+00, li=0.0e+00, npm=1.1e-03)
+T=   6 | Base:  193.18 us | Fused:  151.00 us | Speedup:  1.28x | 83-boundary save:   3.50 ms | err(res=0.0e+00, li=0.0e+00, npm=2.8e-03)
+2026-10-28 20:22:12  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_fused_tilelang` with `out_idx=None`
+2026-10-28 20:22:13  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_fused_tilelang`
+T=  12 | Base:  192.10 us | Fused:  148.39 us | Speedup:  1.29x | 83-boundary save:   3.63 ms | err(res=0.0e+00, li=0.0e+00, npm=2.1e-03)
+T=  16 | Base:  192.35 us | Fused:  148.79 us | Speedup:  1.29x | 83-boundary save:   3.62 ms | err(res=0.0e+00, li=0.0e+00, npm=2.0e-03)
+2026-10-28 20:22:15  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_post_sqrsum_tilelang` with `out_idx=None`
+2026-10-28 20:22:17  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_post_sqrsum_tilelang`
+T=  32 | Base:  253.95 us | Fused:  230.99 us | Speedup:  1.10x | 83-boundary save:   1.91 ms | err(res=0.0e+00, li=0.0e+00, npm=1.2e-07)
+T= 512 | Base:  263.12 us | Fused:  209.15 us | Speedup:  1.26x | 83-boundary save:   4.48 ms | err(res=0.0e+00, li=0.0e+00, npm=1.2e-07)
+T=1536 | Base:  258.57 us | Fused:  210.92 us | Speedup:  1.23x | 83-boundary save:   3.95 ms | err(res=0.0e+00, li=0.0e+00, npm=1.2e-07)
+T=4096 | Base:  574.48 us | Fused:  483.11 us | Speedup:  1.19x | 83-boundary save:   7.58 ms | err(res=0.0e+00, li=0.0e+00, npm=1.2e-07)
+
+================================================================================
+BENCHMARK 2: Sparse MLA Decode (41x per decode step in Target + DSpark)
+================================================================================
+B= 1 (splits=16) | Base:  114.77 us | SM80-w8:   92.77 us (1.24x, err=0.0e+00) | SM80-w4:   92.02 us (1.25x, err=0.0e+00)
+B= 6 (splits= 8) | Base:  116.06 us | SM80-w8:   93.36 us (1.24x, err=0.0e+00) | SM80-w4:   93.34 us (1.24x, err=0.0e+00)
+B=12 (splits= 4) | Base:  132.89 us | SM80-w8:  111.66 us (1.19x, err=4.9e-04) | SM80-w4:  114.49 us (1.16x, err=4.9e-04)
+B=24 (splits= 2) | Base:  249.90 us | SM80-w8:  210.60 us (1.19x, err=9.8e-04) | SM80-w4:  216.20 us (1.16x, err=9.8e-04)
+
+================================================================================
+BENCHMARK 3: combine_topk_swa_indices (30x per prefill chunk)
+================================================================================
+T= 512 | Torch (12 ops): 1336.79 us | Triton (1 op):   51.70 us | Speedup: 25.86x | Bit-exact: True
+T=1536 | Torch (12 ops): 1349.68 us | Triton (1 op):   52.74 us | Speedup: 25.59x | Bit-exact: True
+T=4096 | Torch (12 ops): 1498.72 us | Triton (1 op):   52.28 us | Speedup: 28.67x | Bit-exact: True

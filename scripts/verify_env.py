@@ -8,7 +8,7 @@ environment activated:
 
 Every number printed here maps to a tuning assumption in
 ``patches/vllm-sm80-deepinfer.patch``: SM count drives the split-K heuristics,
-``capability == (8, 0)`` selects ``TRITON_MLA_SPARSE_DSV41``, and the shared
+``capability major == 8`` selects ``TRITON_MLA_SPARSE_DSV41``, and the shared
 memory per SM caps the kernel tile sizes. Reporting the real values makes
 "74 SMs" style discrepancies visible instead of silent.
 """
@@ -87,24 +87,23 @@ def main() -> int:
         except ImportError:
             print(f"{mod:<15} : <not installed>")
 
-    import vllm
+    try:
+        import vllm
+    except ImportError:
+        print()
+        print("error: vllm is not importable; build/install the patched tree first")
+        return 2
 
     print(f"vllm            : {vllm.__version__}")
     print(f"vllm path       : {vllm.__file__}")
 
     section("environment")
     for name in (
-        "VLLM_SM80_ONLY",
         "TORCH_CUDA_ARCH_LIST",
         "VLLM_PP_LAYER_PARTITION",
         "CUDA_HOME",
     ):
         print(f"{name:<24}= {os.environ.get(name, '<unset>')}")
-    if os.environ.get("VLLM_SM80_ONLY") != "1":
-        warnings.append(
-            "VLLM_SM80_ONLY is not 1: a from-source build may try to compile "
-            "Hopper/Blackwell extension targets and fail on SM80"
-        )
 
     section("devices")
     for idx in range(torch.cuda.device_count()):
@@ -118,9 +117,9 @@ def main() -> int:
         if smem is not None:
             print(f"  smem / SM           : {smem[0]} KiB")
             print(f"  smem / block (max)  : {smem[1]} KiB")
-        if cap != (8, 0):
+        if props.major != 8:
             failures.append(
-                f"gpu {idx} ({props.name}) is SM{props.major}{props.minor}, not SM80: "
+                f"gpu {idx} ({props.name}) is SM{props.major}{props.minor}, not Ampere: "
                 "the TRITON_MLA_SPARSE_DSV41 backend only claims major == 8"
             )
 
@@ -140,7 +139,7 @@ def main() -> int:
     for msg in failures:
         print(f"FAIL: {msg}")
     if not warnings and not failures:
-        print("ok: SM80 device, expected SM count, SM80-only build flag set")
+        print("ok: Ampere device with the SM count the tunings were measured on")
     print()
     return 1 if failures else 0
 
