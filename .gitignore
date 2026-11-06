@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+# vLLM checkout next to the patches (scripts/apply_patches.sh uses ./vllm)
+/vllm/
