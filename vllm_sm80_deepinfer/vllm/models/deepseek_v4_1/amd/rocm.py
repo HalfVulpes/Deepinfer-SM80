@@ -763,39 +763,23 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             assert swa_metadata.is_valid_token is not None
             assert self.topk_indices_buffer is not None
             block_size = attn_metadata.block_size // self.compress_ratio
-            decode_cache_key = (
-                self.topk_indices_buffer.data_ptr(),
-                attn_metadata.block_table.data_ptr(),
+            # No memo here: layers that share one KV-cache group's metadata can
+            # follow different index-source layers, so a selection cached on that
+            # metadata goes stale (layers then attend over an earlier source's
+            # top-k). Every consumer re-derives from the shared buffer, which holds
+            # the most recent index source's selection, as in DeepSeek's reference.
+            is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
+            (
+                topk_ragged_indices,
+                topk_ragged_indptr,
+                topk_lens,
+            ) = compute_global_topk_ragged_indices_and_indptr(
+                self.topk_indices_buffer[:num_decode_tokens],
+                swa_metadata.token_to_req_indices,
+                attn_metadata.block_table[:num_decodes],
                 block_size,
-                num_decode_tokens,
-                num_decodes,
+                is_valid,
             )
-            cached_decode = getattr(swa_metadata, "_cached_decode_topk", None)
-            if (
-                self.indexer is None
-                and cached_decode is not None
-                and cached_decode[0] == decode_cache_key
-            ):
-                _, topk_ragged_indices, topk_ragged_indptr, topk_lens = cached_decode
-            else:
-                is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-                (
-                    topk_ragged_indices,
-                    topk_ragged_indptr,
-                    topk_lens,
-                ) = compute_global_topk_ragged_indices_and_indptr(
-                    self.topk_indices_buffer[:num_decode_tokens],
-                    swa_metadata.token_to_req_indices,
-                    attn_metadata.block_table[:num_decodes],
-                    block_size,
-                    is_valid,
-                )
-                swa_metadata._cached_decode_topk = (
-                    decode_cache_key,
-                    topk_ragged_indices,
-                    topk_ragged_indptr,
-                    topk_lens,
-                )
 
         rocm_sparse_attn_decode(
             q=q,
@@ -911,48 +895,26 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            ragged_key = (
-                swa_only,
+            # No memo (see _forward_decode): re-derive per layer from the current
+            # shared top-k buffer.
+            combined_indices, combined_lens = combine_topk_swa_indices(
+                topk_indices[query_start:query_end],
+                query_start_loc[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ],
+                seq_lens[chunk_start:chunk_end],
+                gather_lens[chunk_start:chunk_end],
+                self.window_size,
                 self.compress_ratio,
-                chunk_start,
-                chunk_end,
-                query_start,
-                query_end,
+                top_k,
                 M,
                 N,
-                self.topk_indices_buffer.data_ptr(),
             )
-            cached_ragged = getattr(swa_metadata, "_cached_prefill_ragged", None)
-            if (
-                self.indexer is None
-                and cached_ragged is not None
-                and cached_ragged[0] == ragged_key
-            ):
-                _, ragged_indices, ragged_indptr = cached_ragged
-            else:
-                combined_indices, combined_lens = combine_topk_swa_indices(
-                    topk_indices[query_start:query_end],
-                    query_start_loc[
-                        num_decodes + chunk_start : num_decodes + chunk_end + 1
-                    ],
-                    seq_lens[chunk_start:chunk_end],
-                    gather_lens[chunk_start:chunk_end],
-                    self.window_size,
-                    self.compress_ratio,
-                    top_k,
-                    M,
-                    N,
-                )
-                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                    combined_indices.reshape(combined_indices.shape[0], -1),
-                    combined_lens,
-                    num_rows=self.PREFILL_CHUNK_SIZE * M,
-                )
-                swa_metadata._cached_prefill_ragged = (
-                    ragged_key,
-                    ragged_indices,
-                    ragged_indptr,
-                )
+            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                combined_indices.reshape(combined_indices.shape[0], -1),
+                combined_lens,
+                num_rows=self.PREFILL_CHUNK_SIZE * M,
+            )
 
             rocm_sparse_attn_prefill(
                 q=q[query_start:query_end],
