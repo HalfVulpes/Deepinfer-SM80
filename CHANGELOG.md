@@ -1,9 +1,10 @@
 # Changelog
 
-Notable changes to DeepInfer-SM80. There are no tagged releases yet, so entries are
-dated and name the commits.
+Notable changes to DeepInfer-SM80. Releases are tagged from v0.1.1 on; the untagged
+history before it (2026-10-20 to 2026-10-28, up to `e32bbfe`) counts as 0.1.0, and
+its entries are dated and name the commits.
 
-## Unreleased
+## v0.1.1 (2026-11-06)
 
 ### Fixed
 

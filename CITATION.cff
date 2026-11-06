@@ -6,6 +6,8 @@ authors:
   - alias: "HalfVulpes"
 repository-code: "https://github.com/HalfVulpes/Deepinfer-SM80"
 license: Apache-2.0
+version: 0.1.1
+date-released: "2026-11-06"
 keywords:
   - deepseek
   - deepinfer

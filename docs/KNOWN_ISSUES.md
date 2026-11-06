@@ -5,7 +5,7 @@
 | | |
 | :--- | :--- |
 | **Affected code** | every commit from the initial release `2a828fc` (2026-10-20) through `e32bbfe` (2026-10-28): `patches/vllm-sm80-deepinfer.patch` and the drop-in `vllm/models/deepseek_v4_1/amd/rocm.py` |
-| **Fixed in** | `e2b585f` |
+| **Fixed in** | v0.1.1 (`e2b585f`) |
 | **Found by** | code review against DeepSeek's reference; reproduced by the CPU regression test `tests/test_topk_source_reuse.py` |
 | **Measured effect** | none measurable: in a before/after A/B, long-context copy fidelity and speed could not be told apart (below) |
 | **Why update** | the fix restores DeepSeek's reference behaviour |

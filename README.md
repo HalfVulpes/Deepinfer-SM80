@@ -9,7 +9,7 @@
 
 DeepInfer-SM80 ports the core ideas of DeepSeek's [`DeepInfer`](https://github.com/deepseek-ai/DeepInfer), which targets Blackwell (`tcgen05`, `TMEM`, CuteDSL), to Ampere GPUs such as the A100, A800, RTX 3090 and RTX A6000. It ships as two vLLM patches plus the equivalent drop-in Python/Triton/TileLang modules.
 
-> **Fixed in `e2b585f`:** every version from the initial release (2026-10-20) up to that commit can let some layers use another index source's top-k selection on contexts longer than about 512 tokens. A before/after A/B on 8× GA100 64GB (`TP4 × PP2`, `DSpark K=5`) could not tell the two apart in long-context copy fidelity or speed, but the fix restores DeepSeek's reference behaviour, so please update. See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
+> **Fixed in v0.1.1 (`e2b585f`):** every version from the initial release (2026-10-20) up to that commit can let some layers use another index source's top-k selection on contexts longer than about 512 tokens. A before/after A/B on 8× GA100 64GB (`TP4 × PP2`, `DSpark K=5`) could not tell the two apart in long-context copy fidelity or speed, but the fix restores DeepSeek's reference behaviour, so please update. See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 
 ## Results at a glance
 
