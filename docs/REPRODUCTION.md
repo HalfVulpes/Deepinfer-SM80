@@ -127,7 +127,15 @@ python scripts/check_dropin_sync.py --vllm-dir /path/to/vllm
 
 This byte-compares `vllm_sm80_deepinfer/vllm/**` against the built tree. A
 `DIFF`/`MISSING` line means the Python files you import are not the ones in this
-repository — the exact failure mode behind issue #2.
+repository — the exact failure mode behind issue #2. On a tree patched before
+`e2b585f`, a `DIFF` on `vllm/models/deepseek_v4_1/amd/rocm.py` is the top-k fix
+described in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+The GPU-free unit tests need only a CPU build of torch:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## 6. Run the kernel microbenchmarks (1 GPU is enough)
 
@@ -143,9 +151,9 @@ Expected shape of the output (numbers are hardware-dependent):
 
 | Suite | What is measured |
 | :--- | :--- |
-| `microbench_sm80_kernels.py` | fused mHC, sparse MLA decode/prefill, KV gather |
-| `microbench_sm80_part2.py` | TileLang mHC pre/post kernels |
-| `microbench_sm80_part3.py` | TopK+SWA index combiner vs the torch reference |
+| `microbench_sm80_kernels.py` | fused mHC boundary, sparse MLA decode, TopK+SWA index combiner vs the torch reference |
+| `microbench_sm80_part2.py` | sparse MLA decode parity for `B=1..32`, KV gather |
+| `microbench_sm80_part3.py` | KV gather bit-exactness, decode split/warp sweep, sparse MLA prefill |
 
 ## 7. Known pitfalls
 

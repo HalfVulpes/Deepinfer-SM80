@@ -2,6 +2,8 @@
 
 All numbers below were measured on NVIDIA GA100 64GB (`SM80`, 74 SMs) nodes serving `DeepSeek-V4.1-Flash`. Raw data: [`benchmarks/results/sm80_benchmark_summary.json`](../benchmarks/results/sm80_benchmark_summary.json); charts are regenerated with [`benchmarks/generate_charts.py`](../benchmarks/generate_charts.py). Independent runs on other hardware are archived under [`benchmarks/results/`](../benchmarks/results/) (e.g. the [A800-SXM4-80GB](../benchmarks/results/20261027-a800-80gb-108sm/SUMMARY.md) and [A100-SXM4-80GB](../benchmarks/results/20261028-a100-sxm4-80gb-108sm/SUMMARY.md) runs, both 108 SMs).
 
+> **Measured before the top-k fix in `e2b585f`.** A before/after A/B on the same kind of node (8× GA100 64GB, `TP4 × PP2`, `DSpark K=5`) showed no measurable change in speed or long-context copy fidelity, so the end-to-end numbers on this page stand; see [KNOWN_ISSUES.md](KNOWN_ISSUES.md#beforeafter-ab). The isolated kernel microbenchmarks do not touch the changed code.
+
 ## End-to-end serving
 
 ### 1. 8× NVIDIA GA100 64GB (`SM80`) — `TP4 × PP2` (`20, 20`) + `DSpark K=5` (`12.69 × 1M` Context Pool)

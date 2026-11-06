@@ -9,9 +9,11 @@
 
 DeepInfer-SM80 ports the core ideas of DeepSeek's [`DeepInfer`](https://github.com/deepseek-ai/DeepInfer), which targets Blackwell (`tcgen05`, `TMEM`, CuteDSL), to Ampere GPUs such as the A100, A800, RTX 3090 and RTX A6000. It ships as two vLLM patches plus the equivalent drop-in Python/Triton/TileLang modules.
 
+> **Fixed in `e2b585f`:** every version from the initial release (2026-10-20) up to that commit can let some layers use another index source's top-k selection on contexts longer than about 512 tokens. A before/after A/B on 8× GA100 64GB (`TP4 × PP2`, `DSpark K=5`) could not tell the two apart in long-context copy fidelity or speed, but the fix restores DeepSeek's reference behaviour, so please update. See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
+
 ## Results at a glance
 
-Measured on NVIDIA GA100 64GB (`SM80`, 74 SMs) nodes serving `DeepSeek-V4.1-Flash` with `DSpark K=5` speculative decoding. Kernel speedups are lower on 108-SM A100/A800 parts; full tables, charts and independent runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Measured on NVIDIA GA100 64GB (`SM80`, 74 SMs) nodes serving `DeepSeek-V4.1-Flash` with `DSpark K=5` speculative decoding, before the `e2b585f` fix; the before/after A/B showed no measurable change. Kernel speedups are lower on 108-SM A100/A800 parts; full tables, charts and independent runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 **6 GPUs, `TP2 × PP3`: baseline vLLM vs. DeepInfer-SM80**
 
@@ -71,6 +73,8 @@ Already running an SM80 vLLM tree? Copy the 30 drop-in modules from [`vllm_sm80_
 
 | Document | Contents |
 | :--- | :--- |
+| [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | Correctness issues, who is affected, how to update |
+| [CHANGELOG.md](CHANGELOG.md) | Notable changes by date |
 | [REPRODUCTION.md](docs/REPRODUCTION.md) | Base commit and fork lineage, patching, building, verification, pitfalls |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | End-to-end serving, kernel microbenchmarks, multi-GPU topology comparison |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Kernel-by-kernel design, forward-pass diagram, repository layout |

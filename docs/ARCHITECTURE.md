@@ -11,9 +11,9 @@ flowchart TD
     subgraph Prefill["Chunked Prefill & Decode Forward Pass (40 Backbone + 3 DSpark EAGLE Layers)"]
         A["Input Hidden States + 4-Stream mHC Residual [T, 4, 5120]"] --> B["TileLang mHC Pre-Layer Sinkhorn Routing<br/>(Aligned 6×8×128 FMA + Tensor Core T.gemm @ T>=16)"]
         B --> C{"Layer Type?"}
-        C -->|"Encoder L0–L19<br/>(compress_ratio = 4)"| D["Lightning Indexer + Triton Combine TopK+SWA<br/>(Single-CTA Disjoint Interval Store: 22.17x faster)"]
-        C -->|"YOCO Producer L20<br/>(compress_ratio = 0)"| E["Build Ragged K Metadata Once + Full KV Write<br/>(Cached in ForwardContext for L21–L39)"]
-        C -->|"YOCO Consumers L21–L39<br/>(shared_kv_source = L20)"| F["Reuse L20 Ragged K Metadata + Shared KV Read<br/>(Eliminates 19x Redundant Indexer Metadata Launches)"]
+        C -->|"Encoder L0–L19<br/>(compress_ratio = 0 on L0–L1, 2 on L2–L19)"| D["Lightning Indexer + Triton Combine TopK+SWA<br/>(Single-CTA Disjoint Interval Store: 22.17x faster)"]
+        C -->|"YOCO Producer L20<br/>(compress_ratio = 1)"| E["Indexer Top-K + Full KV Write<br/>(KV read by L21–L39)"]
+        C -->|"YOCO Consumers L21–L39<br/>(kv source = L20)"| F["Shared L20 KV Read + Top-K of the Latest Index Source<br/>(L20/24/28/32/36; ragged indices derived per layer)"]
         D --> G["Unified 512-dim SM80 Sparse MLA Kernel<br/>(Bitshift UE8M0 + 2 CTAs/SM + Direct-Out Split-1)"]
         E --> G
         F --> G
@@ -54,11 +54,12 @@ Previously, `combine_topk_swa_indices` executed a chain of PyTorch GPU tensor al
 DeepSeek-V4.1 executes `mHC` 4-stream residual routing (`hc_mult = 4`, `hidden_size = 5120`) at **83 boundaries per forward pass** (`2 × 40` backbone layers + `3` DSpark EAGLE layers).
 - **Aligned Split Geometry for `hidden_size = 5120`**: The stock `_SMALL_FMA_CONFIG = (6, 16, 128)` splits `5120` into `16` slices of `320` elements (`320 % 128 = 64 != 0`), failing alignment checks and falling back to an under-occupied `10-block` launch on SM80 (`13.5%` of an A100's SMs!). Adding `(6, 8, 128)` (`5120 // 8 = 640 = 5 × 128`, launching `40` blocks) and lowering `_SMALL_M_THRESHOLD` from `32 → 16` so `T >= 16` dispatches to Tensor Core `T.gemm` delivers a **`2.89×` speedup at `T=12`** (`357.7 µs → 123.8 µs`) and **`1.30×` at `T=6`**.
 
-### 5. YOCO (`L20`) Ragged Indexer Metadata Reuse Across `L20–L39`
-**File:** [`vllm/models/deepseek_v4_1/nvidia/model.py`](../vllm_sm80_deepinfer/vllm/models/deepseek_v4_1/nvidia/model.py)
+### 5. YOCO (`L20`) Shared KV and Per-Layer Top-K Reuse Across `L20–L39`
+**Files:** [`vllm/models/deepseek_v4_1/attention.py`](../vllm_sm80_deepinfer/vllm/models/deepseek_v4_1/attention.py), [`vllm/models/deepseek_v4_1/amd/rocm.py`](../vllm_sm80_deepinfer/vllm/models/deepseek_v4_1/amd/rocm.py)
 
-- In DeepSeek-V4.1's You-Only-Cache-Once (`YOCO`) architecture, Layers `21–39` (`shared_kv_source_layer = 20`, `compress_ratio = 1`) all read from Layer 20's full-resolution KV cache and share identical `seq_lens_expanded`, `block_table`, and `compress_ratio`.
-- Caching `(k_ragged_offset, k_ragged_SlotMapping, total_k)` in `forward_context` at `L20` eliminates **19 redundant `build_ragged_k_Metadata` GPU kernel chains per prefill chunk**.
+- In DeepSeek-V4.1's You-Only-Cache-Once (`YOCO`) architecture, Layers `21–39` (`compress_ratio = 1`) keep no compressed KV of their own: they read Layer 20's full-resolution KV cache and its block table (`kv_source_layer_ids = [2, 8, 14, 20]`).
+- Top-k selections come only from the index sources (`index_source_layer_ids = [2, 8, 14, 20, 24, 28, 32, 36]`), which publish them in the shared `topk_indices_buffer`. Every other layer attends over the selection of the most recent index source below it, so `L21–L23` use `L20`'s selection, `L25–L27` use `L24`'s, and so on.
+- Each layer derives its ragged attention indices from that buffer when it runs. Until `e2b585f` they were memoised on KV-cache-group metadata that layers of different index sources share, so on long contexts some layers could use an earlier source's selection; see [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
 ### 6. Multi-Stage Pipeline Parallelism (`TP2 × PP3` & `TP4 × PP2`), Cross-PP Shared KV (`pp_share.py`), & 1M Streamed Indexer
 **Files:** [`vllm/models/deepseek_v4_1/pp_share.py`](../vllm_sm80_deepinfer/vllm/models/deepseek_v4_1/pp_share.py), [`vllm/v1/attention/ops/mqa_logits_candidates_triton.py`](../vllm_sm80_deepinfer/vllm/v1/attention/ops/mqa_logits_candidates_triton.py), [`vllm/v1/attention/backends/mla/streamed_workspace.py`](../vllm_sm80_deepinfer/vllm/v1/attention/backends/mla/streamed_workspace.py), [`vllm/models/deepseek_v4_1/nvidia/dspark.py`](../vllm_sm80_deepinfer/vllm/models/deepseek_v4_1/nvidia/dspark.py)
@@ -75,9 +76,10 @@ Deepinfer-SM80/
 ├── README.md                          # Overview, headline results, quick start
 ├── LICENSE                            # Apache-2.0 License
 ├── CITATION.cff                       # Citation metadata (DeepInfer-SM80, DeepInfer, vLLM)
+├── CHANGELOG.md                       # Notable changes by date
 ├── patches/
 │   ├── 00-vllm-pr56201-sm80-base.patch # Base SM80 enablement patch on top of vllm PR #56201 (79a7108d9a)
-│   └── vllm-sm80-deepinfer.patch      # Complete DeepInfer-SM80 + PP/DSpark/1M-context patch (30 files, 4,289 lines)
+│   └── vllm-sm80-deepinfer.patch      # Complete DeepInfer-SM80 + PP/DSpark/1M-context patch (30 files, 4,214 lines)
 ├── vllm_sm80_deepinfer/               # Drop-in optimized vLLM Python/Triton/TileLang modules (all 30 files)
 │   └── vllm/
 │       ├── model_executor/
@@ -91,7 +93,7 @@ Deepinfer-SM80/
 │       │   ├── attention.py                          # Per-head Triton indexer warmup
 │       │   ├── common/engram.py                      # Exact-size cudaHostRegister + C pthread pread gather
 │       │   ├── common/ops/cache_utils.py             # Bitshift UE8M0 + direct-store KV gather kernels
-│       │   ├── nvidia/{model.py, vl_model.py, dspark.py} # YOCO metadata reuse, PP input_ids, TP-sharded DSpark
+│       │   ├── nvidia/{model.py, vl_model.py, dspark.py} # mHC fusion, PP share plan, PP input_ids, TP-sharded DSpark
 │       │   └── pp_share.py                           # Cross-PP YOCO shared KV / indexer-K / candidate replication
 │       └── v1/
 │           ├── attention/backends/{utils.py, mla/indexer.py, mla/streamed_workspace.py}
@@ -107,11 +109,14 @@ Deepinfer-SM80/
 ├── docker/
 │   └── Dockerfile.sm80                # CUDA 13.0 + Python 3.12 + GCC 13 Ampere-only build
 ├── .github/workflows/patch-stack.yml  # GPU-free CI: patch stack applies and matches the drop-ins
+├── .github/workflows/tests.yml        # GPU-free CI: unit tests on CPU-only PyTorch
+├── tests/
+│   └── test_topk_source_reuse.py      # Each layer attends over its own index source's top-k
 ├── benchmarks/
 │   ├── bench_8gpu_scaling.py          # 8-GPU TP4xPP2 decode & prefill concurrency benchmark
-│   ├── microbench_sm80_kernels.py     # Isolated SM80 microbenchmark: Sparse MLA & KV gather
-│   ├── microbench_sm80_part2.py       # Isolated SM80 microbenchmark: TileLang mHC kernels
-│   ├── microbench_sm80_part3.py       # Isolated SM80 microbenchmark: TopK+SWA combiner
+│   ├── microbench_sm80_kernels.py     # Isolated SM80 microbenchmark: mHC boundary, Sparse MLA decode, TopK+SWA combiner
+│   ├── microbench_sm80_part2.py       # Isolated SM80 microbenchmark: Sparse MLA decode parity, KV gather
+│   ├── microbench_sm80_part3.py       # Isolated SM80 microbenchmark: KV gather bit-exactness, decode splits, Sparse MLA prefill
 │   ├── generate_charts.py             # Reproducible 300-DPI Matplotlib chart generator
 │   └── results/
 │       ├── sm80_benchmark_summary.json # Complete kernel & E2E benchmark dataset
@@ -123,6 +128,7 @@ Deepinfer-SM80/
 │   ├── 04_e2e_production_throughput.png
 │   └── 05_8gpu_tp4pp2_scaling_1_2_4_12.png
 └── docs/
+    ├── KNOWN_ISSUES.md                 # Correctness issues, who is affected, how to update
     ├── REPRODUCTION.md                 # Install / build / verify procedure and pitfalls
     ├── BENCHMARKS.md                   # Full benchmark tables and charts
     ├── ARCHITECTURE.md                 # This document
